@@ -10,6 +10,8 @@ dependencies {
 
     // Used by SpoofSignaturePatch.
     implementation(libs.hiddenapi)
+
+    testImplementation(libs.junit)
 }
 
 configure<ApplicationExtension> {
