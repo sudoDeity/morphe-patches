@@ -26,6 +26,7 @@ import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction3rc
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction35c
 import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.RegisterRangeInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
@@ -403,8 +404,8 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
             """
                 invoke-virtual {v0}, Lcom/reddit/domain/model/Link;->getUrl()Ljava/lang/String;
                 move-result-object v14
-                move-object v15, v13
-                invoke-static/range {v14 .. v15}, $EXTENSION_CLASS->registerCachedRedgifs(Ljava/lang/String;Ljava/lang/String;)V
+                move-object v15, v3
+                invoke-static/range {v14 .. v15}, $EXTENSION_CLASS->registerCachedRedgifs(Ljava/lang/String;Ljava/lang/Object;)V
             """.trimIndent(),
         )
 
@@ -485,9 +486,36 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
             "Expected exactly one PlaybackController.provideMediaSource method, found ${provideMediaSourceMethods.size}"
         }
         val provideMediaSource = provideMediaSourceMethods.single()
+        val provideMediaSourceInstructions =
+            provideMediaSource.implementation?.instructions?.toList()
+                ?: error("PlaybackController.provideMediaSource has no implementation")
+        val uriParseInvokes = provideMediaSourceInstructions.mapIndexedNotNull { index, instruction ->
+            val reference = (instruction as? ReferenceInstruction)?.reference as? MethodReference
+                ?: return@mapIndexedNotNull null
+            if (
+                instruction.opcode == Opcode.INVOKE_STATIC_RANGE &&
+                reference.definingClass == URI_CLASS &&
+                reference.name == "parse" &&
+                reference.parameterTypes.map { it.toString() } == listOf("Ljava/lang/String;") &&
+                reference.returnType == URI_CLASS
+            ) index else null
+        }
+        require(uriParseInvokes.size == 1) {
+            "Expected exactly one Uri.parse(String) in PlaybackController.provideMediaSource, found ${uriParseInvokes.size}"
+        }
+        val uriParseIndex = uriParseInvokes.single()
+        val uriParseInstruction =
+            provideMediaSourceInstructions[uriParseIndex] as? RegisterRangeInstruction
+                ?: error("PlaybackController Uri.parse is not a range invocation")
         val playbackUrlRegister = provideMediaSource.declaredParameterRegister(1)
+        require(
+            uriParseInstruction.registerCount == 1 &&
+                uriParseInstruction.startRegister == playbackUrlRegister
+        ) {
+            "PlaybackController Uri.parse does not consume the declared playback URL register"
+        }
         provideMediaSource.addInstructions(
-            0,
+            uriParseIndex,
             listOf(
                 invokeStaticRange(
                     "rewritePlaybackUrl",
