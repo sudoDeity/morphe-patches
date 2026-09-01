@@ -128,6 +128,7 @@ public final class RedgifsPlaybackPatch {
 
     public static void prewarmCachedLinkJson(String linkJson) {
         if (linkJson == null || linkJson.isEmpty()) return;
+        if (!REDGIFS_SLUG.matcher(linkJson).find()) return;
         try {
             JSONObject link = new JSONObject(linkJson);
             String slug = findFirst(REDGIFS_SLUG, link.optString("url", null));
@@ -271,7 +272,14 @@ public final class RedgifsPlaybackPatch {
     }
 
     public static boolean forceCacheUriValidation(boolean original, Object uriObject) {
-        return original || (uriObject instanceof Uri && isRedgifsMedia((Uri) uriObject));
+        if (original) return true;
+        if (!(uriObject instanceof Uri)) return false;
+
+        Uri uri = (Uri) uriObject;
+        if (isRedgifsMedia(uri)) return true;
+
+        String mediaId = findFirst(REDDIT_MEDIA_ID, uri.toString());
+        return mediaId != null && MEDIA_TO_SLUG.containsKey(mediaId);
     }
 
     public static Object prepareDataSpec(Object dataSpec) {
