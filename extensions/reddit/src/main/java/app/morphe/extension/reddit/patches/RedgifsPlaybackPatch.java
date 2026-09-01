@@ -67,6 +67,7 @@ public final class RedgifsPlaybackPatch {
     private static final long INITIAL_RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final long MAX_RETRY_DELAY_NANOS = TimeUnit.MINUTES.toNanos(1);
     private static final long PLAYBACK_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(800);
+    private static final long PLAYBACK_RETRY_COOLDOWN_NANOS = TimeUnit.MILLISECONDS.toNanos(750);
 
     private static final Pattern REDGIFS_SLUG = Pattern.compile(
             "https?://(?:[A-Za-z0-9-]+\\.)*redgifs\\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)",
@@ -376,25 +377,34 @@ public final class RedgifsPlaybackPatch {
         }
     }
 
-    /** Uses only statically present RedditVideo URL getters; the first URL containing an id wins. */
+    /**
+     * Uses every statically present RedditVideo URL getter and accepts only one unique media id.
+     * If two URL fields disagree, fail closed instead of choosing an arbitrary source identity.
+     */
     private static String redditVideoMediaId(Object redditVideo) {
         if (redditVideo == null ||
                 !"com.reddit.domain.model.RedditVideo".equals(redditVideo.getClass().getName())) {
             return null;
         }
 
+        String resolvedMediaId = null;
         for (String getterName : REDDIT_VIDEO_URL_GETTERS) {
             try {
                 Method getter = redditVideo.getClass().getMethod(getterName);
                 Object value = getter.invoke(redditVideo);
                 if (!(value instanceof String)) continue;
                 String mediaId = findFirst(REDDIT_MEDIA_ID, (String) value);
-                if (mediaId != null) return mediaId;
+                if (mediaId == null) continue;
+                if (resolvedMediaId == null) {
+                    resolvedMediaId = mediaId;
+                } else if (!resolvedMediaId.equals(mediaId)) {
+                    return null;
+                }
             } catch (ReflectiveOperationException | RuntimeException ignored) {
                 // Continue through the other statically present URL getters.
             }
         }
-        return null;
+        return resolvedMediaId;
     }
 
     private static ResolutionEntry entryForSlug(String slug) {
@@ -449,10 +459,6 @@ public final class RedgifsPlaybackPatch {
                 return;
             }
 
-            // Backoff protects speculative prewarm traffic. A real playback request must be
-            // allowed to retry immediately instead of inheriting an earlier prewarm failure.
-            if (!playbackPriority && nowNanos < entry.nextRetryAtNanos) return;
-
             if (entry.resolving) {
                 ResolutionTask pending = entry.pendingTask;
                 if (playbackPriority && pending != null && !pending.playbackPriority &&
@@ -463,9 +469,13 @@ public final class RedgifsPlaybackPatch {
                     return;
                 }
             } else {
-                if (!playbackPriority && RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) {
-                    return;
+                if (playbackPriority) {
+                    if (nowNanos < entry.nextPlaybackRetryAtNanos) return;
+                } else {
+                    if (nowNanos < entry.nextRetryAtNanos) return;
+                    if (RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) return;
                 }
+
                 taskToSchedule = new ResolutionTask(entry, playbackPriority);
                 entry.pendingTask = taskToSchedule;
                 entry.resolving = true;
@@ -479,13 +489,18 @@ public final class RedgifsPlaybackPatch {
                 if (entry.pendingTask == taskToSchedule) {
                     entry.pendingTask = null;
                     entry.resolving = false;
+                    if (taskToSchedule.playbackPriority) {
+                        entry.nextPlaybackRetryAtNanos =
+                                System.nanoTime() + PLAYBACK_RETRY_COOLDOWN_NANOS;
+                    }
                     entry.notifyAll();
                 }
             }
         }
     }
 
-    private static void completeResolution(ResolutionEntry entry, ResolutionResult result) {
+    private static void completeResolution(ResolutionEntry entry, ResolutionResult result,
+                                           boolean playbackPriority) {
         ResolvedRoute published = null;
         if (result.directUrl != null) {
             published = new ResolvedRoute(
@@ -509,16 +524,22 @@ public final class RedgifsPlaybackPatch {
                 entry.route = published;
                 entry.failureCount = 0;
                 entry.nextRetryAtNanos = 0;
+                entry.nextPlaybackRetryAtNanos = 0;
                 entry.terminalFailure = TerminalFailure.NONE;
             } else if (result.terminalFailure == TerminalFailure.GIF_DELETED) {
                 entry.route = null;
                 entry.failureCount = 0;
                 entry.nextRetryAtNanos = 0;
+                entry.nextPlaybackRetryAtNanos = 0;
                 entry.terminalFailure = TerminalFailure.GIF_DELETED;
             } else {
+                long nowNanos = System.nanoTime();
                 entry.failureCount = Math.min(entry.failureCount + 1, MAX_RETRY_EXPONENT + 1);
                 long delay = INITIAL_RETRY_DELAY_NANOS << (entry.failureCount - 1);
-                entry.nextRetryAtNanos = System.nanoTime() + Math.min(delay, MAX_RETRY_DELAY_NANOS);
+                entry.nextRetryAtNanos = nowNanos + Math.min(delay, MAX_RETRY_DELAY_NANOS);
+                if (playbackPriority) {
+                    entry.nextPlaybackRetryAtNanos = nowNanos + PLAYBACK_RETRY_COOLDOWN_NANOS;
+                }
             }
             entry.notifyAll();
         }
@@ -918,6 +939,7 @@ public final class RedgifsPlaybackPatch {
         ResolutionTask pendingTask;
         int failureCount;
         long nextRetryAtNanos;
+        long nextPlaybackRetryAtNanos;
         TerminalFailure terminalFailure = TerminalFailure.NONE;
 
         ResolutionEntry(String slug) {
@@ -955,7 +977,7 @@ public final class RedgifsPlaybackPatch {
                 result = resolveDirectMediaUrl(entry.slug);
             } catch (RuntimeException ignored) {
             }
-            completeResolution(entry, result);
+            completeResolution(entry, result, playbackPriority);
         }
     }
 
