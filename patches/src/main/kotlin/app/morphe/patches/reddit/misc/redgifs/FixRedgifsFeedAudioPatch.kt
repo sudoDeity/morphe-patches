@@ -32,9 +32,12 @@ private const val GRAPHQL_MAPPER_CLASS =
 private const val GRAPHQL_MEDIA_FRAGMENT_CLASS = "Lsgt;"
 private const val GRAPHQL_REDDIT_VIDEO_MEDIA_CLASS = "Lrgt;"
 private const val VIDEO_MEDIA_FRAGMENT_CLASS = "Lgim0;"
+private const val LINK_DATA_MODEL_CLASS = "Lnmr;"
 private const val REDDIT_VIDEO_CLASS = "Lcom/reddit/domain/model/RedditVideo;"
 private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/reddit/patches/RedgifsDebug;"
+private const val HYDRATION_PROBE_CLASS =
+    "Lapp/morphe/extension/reddit/patches/RedgifsHydrationProbe;"
 
 private const val MEDIA_FRAGMENT_INTERFACE =
     $$"Lapp/morphe/extension/reddit/patches/RedgifsPlaybackPatch$MediaFragmentInterface;"
@@ -87,12 +90,13 @@ private fun invokeStaticRange(
     returnType: String,
     startRegister: Int,
     registerCount: Int,
+    definingClass: String = EXTENSION_CLASS,
 ): BuilderInstruction = BuilderInstruction3rc(
     Opcode.INVOKE_STATIC_RANGE,
     startRegister,
     registerCount,
     ImmutableMethodReference(
-        EXTENSION_CLASS,
+        definingClass,
         methodName,
         parameterTypes,
         returnType,
@@ -247,6 +251,61 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
                 ),
             )
         }
+
+        /*
+         * Diagnostic only: observe hydration of the exact persisted HOME/BEST fixture that showed
+         * the cold-start no_identity race. This does not register identity or start resolution.
+         */
+        val linkDataModelClass = mutableClassDefBy(LINK_DATA_MODEL_CLASS)
+        val linkDataModelConstructorParameters = listOf(
+            "Ljava/lang/String;",
+            "I",
+            "Ljava/lang/String;",
+            "J",
+            "Ljava/lang/String;",
+            "Ljava/lang/String;",
+            "Z",
+            "Ljava/lang/String;",
+            "Z",
+            "Z",
+            "Z",
+            "Ljava/lang/String;",
+        )
+        val linkDataModelConstructors = linkDataModelClass.methods.filter { method ->
+            method.name == "<init>" &&
+                method.parameterTypes.map { it.toString() } == linkDataModelConstructorParameters &&
+                method.returnType == "V"
+        }
+        require(linkDataModelConstructors.size == 1) {
+            "Expected exactly one LinkDataModel constructor, found ${linkDataModelConstructors.size}"
+        }
+        val linkDataModelConstructor = linkDataModelConstructors.single()
+        require(!AccessFlags.STATIC.isSet(linkDataModelConstructor.accessFlags)) {
+            "Expected LinkDataModel constructor to be an instance method"
+        }
+        val linkDataModelInstructions =
+            linkDataModelConstructor.implementation?.instructions?.toList()
+                ?: error("LinkDataModel constructor has no implementation")
+        val linkDataModelReturnSites = linkDataModelInstructions.mapIndexedNotNull { index, instruction ->
+            if (instruction.opcode == Opcode.RETURN_VOID) index else null
+        }
+        require(linkDataModelReturnSites.size == 1) {
+            "Expected exactly one LinkDataModel constructor return, found ${linkDataModelReturnSites.size}"
+        }
+        val linkIdRegister = linkDataModelConstructor.declaredParameterRegister(0)
+        linkDataModelConstructor.addInstructions(
+            linkDataModelReturnSites.single(),
+            listOf(
+                invokeStaticRange(
+                    "observeLinkDataModel",
+                    listOf("Ljava/lang/String;", "I", "Ljava/lang/String;", "J"),
+                    "V",
+                    linkIdRegister,
+                    5,
+                    HYDRATION_PROBE_CLASS,
+                ),
+            ),
+        )
 
         val constructor = VideoPropsConstructorFingerprint.method
         val videoPropsClass = VideoPropsConstructorFingerprint.classDef
