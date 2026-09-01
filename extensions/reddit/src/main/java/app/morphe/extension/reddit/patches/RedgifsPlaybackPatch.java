@@ -32,11 +32,13 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -56,7 +58,8 @@ public final class RedgifsPlaybackPatch {
             "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
 
-    private static final int MAX_PENDING_RESOLUTIONS = 32;
+    /** Prewarm is opportunistic; actual playback requests are never rejected by this cap. */
+    private static final int MAX_PENDING_PREWARMS = 32;
     private static final int MAX_RETRY_EXPONENT = 6;
     private static final long DIRECT_URL_FALLBACK_LIFETIME_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final long DIRECT_URL_EXPIRY_MARGIN_MILLIS = TimeUnit.SECONDS.toMillis(5);
@@ -85,21 +88,30 @@ public final class RedgifsPlaybackPatch {
             "\\\"code\\\"\\s*:\\s*\\\"GifDeleted\\\""
     );
 
+    private static final String[] REDDIT_VIDEO_URL_GETTERS = {
+            "getPackagedMp4Url",
+            "getDashUrl",
+            "getFallBackUrl",
+            "getHlsUrl"
+    };
+
     private static final ThreadLocal<String> PENDING_REDGIFS_SLUG = new ThreadLocal<>();
 
     private static final ConcurrentHashMap<String, String> MEDIA_TO_SLUG =
             new ConcurrentHashMap<>();
+    private static final Set<String> CONFLICTED_MEDIA_IDS = ConcurrentHashMap.newKeySet();
     private static final ConcurrentHashMap<String, ResolutionEntry> RESOLUTIONS_BY_SLUG =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, ResolvedRoute> ROUTES_BY_URL =
             new ConcurrentHashMap<>();
 
+    private static final AtomicLong RESOLUTION_SEQUENCE = new AtomicLong();
     private static final ThreadPoolExecutor RESOLVER = new ThreadPoolExecutor(
             2,
             2,
             0L,
             TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(MAX_PENDING_RESOLUTIONS),
+            new PriorityBlockingQueue<>(),
             new ThreadFactory() {
                 private int nextId = 1;
 
@@ -109,21 +121,19 @@ public final class RedgifsPlaybackPatch {
                     thread.setDaemon(true);
                     return thread;
                 }
-            },
-            new ThreadPoolExecutor.AbortPolicy()
+            }
     );
 
     private static final Object TOKEN_LOCK = new Object();
     private static volatile String temporaryToken;
     private static volatile DataSpecAccess dataSpecAccess;
-    private static volatile Method redditVideoGetDashUrlMethod;
 
     private RedgifsPlaybackPatch() {
     }
 
     public static void prewarmRedgifs(String embedHtml, String url) {
         String slug = findRedgifsSlug(embedHtml, url);
-        if (slug != null) startResolution(entryForSlug(slug));
+        if (slug != null) startResolution(entryForSlug(slug), false);
     }
 
     public static void prewarmCachedLinkJson(String linkJson) {
@@ -132,7 +142,7 @@ public final class RedgifsPlaybackPatch {
         try {
             JSONObject link = new JSONObject(linkJson);
             String slug = findFirst(REDGIFS_SLUG, link.optString("url", null));
-            if (slug != null) startResolution(entryForSlug(slug));
+            if (slug != null) startResolution(entryForSlug(slug), false);
         } catch (JSONException | RuntimeException ignored) {
         }
     }
@@ -217,21 +227,34 @@ public final class RedgifsPlaybackPatch {
         }
     }
 
-    public static void registerCachedRedgifs(String linkUrl, String dashUrl) {
+    /** Cache/domain feed path: Link.url supplies the slug; RedditVideo supplies the media id. */
+    public static void registerCachedRedgifs(String linkUrl, Object redditVideo) {
         String slug = findRedgifsSlug(null, linkUrl);
-        String mediaId = findFirst(REDDIT_MEDIA_ID, dashUrl);
+        String mediaId = redditVideoMediaId(redditVideo);
         if (slug != null && mediaId != null) registerIdentity(mediaId, slug);
     }
 
+    /**
+     * Identity is immutable once agreed. If two structural producers disagree for one media id,
+     * fail closed for that id instead of silently routing it to the last writer's RedGIFs slug.
+     */
     private static void registerIdentity(String mediaId, String slug) {
-        MEDIA_TO_SLUG.put(mediaId, slug);
-        startResolution(entryForSlug(slug));
+        if (mediaId == null || slug == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return;
+
+        String existing = MEDIA_TO_SLUG.putIfAbsent(mediaId, slug);
+        if (existing != null && !existing.equals(slug)) {
+            CONFLICTED_MEDIA_IDS.add(mediaId);
+            MEDIA_TO_SLUG.remove(mediaId);
+            return;
+        }
+
+        startResolution(entryForSlug(slug), false);
     }
 
     public static boolean overrideIsGif(boolean originalIsGif, Object redditVideo) {
         if (!originalIsGif) return false;
         String mediaId = redditVideoMediaId(redditVideo);
-        if (mediaId == null) return true;
+        if (mediaId == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return true;
 
         String slug = MEDIA_TO_SLUG.get(mediaId);
         if (slug == null) return true;
@@ -255,7 +278,7 @@ public final class RedgifsPlaybackPatch {
         if (isRedgifsMedia(currentUri)) return currentUrl;
 
         String mediaId = findFirst(REDDIT_MEDIA_ID, currentUrl);
-        if (mediaId == null) return currentUrl;
+        if (mediaId == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return currentUrl;
         String slug = MEDIA_TO_SLUG.get(mediaId);
         if (slug == null) return currentUrl;
 
@@ -263,7 +286,8 @@ public final class RedgifsPlaybackPatch {
         ResolvedRoute route = validRoute(entry, System.nanoTime());
         if (route != null) return route.directUrl;
 
-        startResolution(entry);
+        // A real playback request promotes a queued prewarm for this slug if possible.
+        startResolution(entry, true);
         if (Looper.myLooper() != Looper.getMainLooper()) {
             route = awaitRoute(entry);
             if (route != null) return route.directUrl;
@@ -279,7 +303,9 @@ public final class RedgifsPlaybackPatch {
         if (isRedgifsMedia(uri)) return true;
 
         String mediaId = findFirst(REDDIT_MEDIA_ID, uri.toString());
-        return mediaId != null && MEDIA_TO_SLUG.containsKey(mediaId);
+        return mediaId != null &&
+                !CONFLICTED_MEDIA_IDS.contains(mediaId) &&
+                MEDIA_TO_SLUG.containsKey(mediaId);
     }
 
     public static Object prepareDataSpec(Object dataSpec) {
@@ -338,22 +364,25 @@ public final class RedgifsPlaybackPatch {
         }
     }
 
+    /** Uses only statically present RedditVideo URL getters; the first URL containing an id wins. */
     private static String redditVideoMediaId(Object redditVideo) {
         if (redditVideo == null ||
                 !"com.reddit.domain.model.RedditVideo".equals(redditVideo.getClass().getName())) {
             return null;
         }
-        try {
-            Method method = redditVideoGetDashUrlMethod;
-            if (method == null || method.getDeclaringClass() != redditVideo.getClass()) {
-                method = redditVideo.getClass().getMethod("getDashUrl");
-                redditVideoGetDashUrlMethod = method;
+
+        for (String getterName : REDDIT_VIDEO_URL_GETTERS) {
+            try {
+                Method getter = redditVideo.getClass().getMethod(getterName);
+                Object value = getter.invoke(redditVideo);
+                if (!(value instanceof String)) continue;
+                String mediaId = findFirst(REDDIT_MEDIA_ID, (String) value);
+                if (mediaId != null) return mediaId;
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Continue through the other statically present URL getters.
             }
-            Object value = method.invoke(redditVideo);
-            return value instanceof String ? findFirst(REDDIT_MEDIA_ID, (String) value) : null;
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-            return null;
         }
+        return null;
     }
 
     private static ResolutionEntry entryForSlug(String slug) {
@@ -370,7 +399,10 @@ public final class RedgifsPlaybackPatch {
         if (sameNetwork && nowNanos < route.expiresAtNanos) return route;
 
         synchronized (entry) {
-            if (entry.route == route) entry.route = null;
+            if (entry.route == route) {
+                entry.route = null;
+                ROUTES_BY_URL.remove(route.directUrl, route);
+            }
         }
         return null;
     }
@@ -396,29 +428,46 @@ public final class RedgifsPlaybackPatch {
         }
     }
 
-    private static void startResolution(ResolutionEntry entry) {
+    private static void startResolution(ResolutionEntry entry, boolean playbackPriority) {
+        ResolutionTask taskToSchedule = null;
+
         synchronized (entry) {
             long nowNanos = System.nanoTime();
-            if (entry.resolving ||
-                    entry.terminalFailure == TerminalFailure.GIF_DELETED ||
+            if (entry.terminalFailure == TerminalFailure.GIF_DELETED ||
                     validRoute(entry, nowNanos) != null ||
                     nowNanos < entry.nextRetryAtNanos) {
                 return;
             }
-            entry.resolving = true;
+
+            if (entry.resolving) {
+                ResolutionTask pending = entry.pendingTask;
+                if (playbackPriority && pending != null && !pending.playbackPriority &&
+                        RESOLVER.remove(pending)) {
+                    taskToSchedule = new ResolutionTask(entry, true);
+                    entry.pendingTask = taskToSchedule;
+                } else {
+                    return;
+                }
+            } else {
+                if (!playbackPriority && RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) {
+                    return;
+                }
+                taskToSchedule = new ResolutionTask(entry, playbackPriority);
+                entry.pendingTask = taskToSchedule;
+                entry.resolving = true;
+            }
         }
 
         try {
-            RESOLVER.execute(() -> {
-                ResolutionResult result = ResolutionResult.TRANSIENT_FAILURE;
-                try {
-                    result = resolveDirectMediaUrl(entry.slug);
-                } catch (RuntimeException ignored) {
-                }
-                completeResolution(entry, result);
-            });
+            RESOLVER.execute(taskToSchedule);
         } catch (RuntimeException exception) {
-            completeResolution(entry, ResolutionResult.TRANSIENT_FAILURE);
+            synchronized (entry) {
+                if (entry.pendingTask == taskToSchedule) {
+                    entry.pendingTask = null;
+                    entry.resolving = false;
+                    entry.notifyAll();
+                }
+            }
         }
     }
 
@@ -439,7 +488,10 @@ public final class RedgifsPlaybackPatch {
             ROUTES_BY_URL.put(published.directUrl, published);
         }
 
+        ResolvedRoute previous;
         synchronized (entry) {
+            previous = entry.route;
+            entry.pendingTask = null;
             entry.resolving = false;
             if (published != null) {
                 entry.route = published;
@@ -457,6 +509,10 @@ public final class RedgifsPlaybackPatch {
                 entry.nextRetryAtNanos = System.nanoTime() + Math.min(delay, MAX_RETRY_DELAY_NANOS);
             }
             entry.notifyAll();
+        }
+
+        if (previous != null && previous != published) {
+            ROUTES_BY_URL.remove(previous.directUrl, previous);
         }
     }
 
@@ -851,12 +907,47 @@ public final class RedgifsPlaybackPatch {
         final String slug;
         volatile ResolvedRoute route;
         boolean resolving;
+        ResolutionTask pendingTask;
         int failureCount;
         long nextRetryAtNanos;
         TerminalFailure terminalFailure = TerminalFailure.NONE;
 
         ResolutionEntry(String slug) {
             this.slug = slug;
+        }
+    }
+
+    private static final class ResolutionTask implements Runnable, Comparable<ResolutionTask> {
+        final ResolutionEntry entry;
+        final boolean playbackPriority;
+        final long sequence = RESOLUTION_SEQUENCE.getAndIncrement();
+
+        ResolutionTask(ResolutionEntry entry, boolean playbackPriority) {
+            this.entry = entry;
+            this.playbackPriority = playbackPriority;
+        }
+
+        @Override
+        public int compareTo(ResolutionTask other) {
+            if (playbackPriority != other.playbackPriority) {
+                return playbackPriority ? -1 : 1;
+            }
+            return Long.compare(sequence, other.sequence);
+        }
+
+        @Override
+        public void run() {
+            synchronized (entry) {
+                if (entry.pendingTask != this) return;
+                entry.pendingTask = null;
+            }
+
+            ResolutionResult result = ResolutionResult.TRANSIENT_FAILURE;
+            try {
+                result = resolveDirectMediaUrl(entry.slug);
+            } catch (RuntimeException ignored) {
+            }
+            completeResolution(entry, result);
         }
     }
 
