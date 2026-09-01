@@ -30,21 +30,25 @@ import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
-import com.android.tools.smali.dexlib2.immutable.reference.ImmutableFieldReference
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableMethodReference
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableTypeReference
 
 private const val GRAPHQL_MAPPER_CLASS =
     "Lcom/reddit/data/model/graphql/GqlDataToMediaDomainModelMapperKt;"
 private const val GRAPHQL_MEDIA_FRAGMENT_CLASS = "Lsgt;"
-private const val LINK_DATA_MODEL_CLASS = "Lnmr;"
+private const val VIDEO_MEDIA_FRAGMENT_CLASS = "Lgim0;"
+private const val ON_CELL_GROUP_FRAGMENT_CLASS = "Lety;"
+private const val CELL_GROUP_FRAGMENT_CLASS = "Lxb7;"
 private const val REDDIT_VIDEO_CLASS = "Lcom/reddit/domain/model/RedditVideo;"
-private const val VIDEO_PROPS_CLASS = "Lmkm0;"
-private const val PLAYBACK_KEY_CLASS = "Lpm00;"
-private const val PROGRESSIVE_MEDIA_PERIOD_CLASS = "Landroidx/media3/exoplayer/source/b;"
+private const val PLAYBACK_CONTROLLER_CLASS =
+    "Lcom/reddit/exokit/internal/data/coordinator/a;"
+private const val MEDIA_SOURCE_REPOSITORY_CLASS = "Lcom/reddit/mediacomponent/data/a;"
+private const val MEDIA_ITEM_CLASS = "Lmit;"
+private const val PLAYER_CACHE_CONTEXT_CLASS = "Lin00;"
+private const val CONTINUATION_IMPL_CLASS = "Lkotlin/coroutines/jvm/internal/ContinuationImpl;"
 private const val PROGRESSIVE_LOADABLE_CLASS = "Ll150;"
-private const val URI_CLASS = "Landroid/net/Uri;"
 private const val DATA_SPEC_CLASS = "Lode;"
+private const val URI_CLASS = "Landroid/net/Uri;"
 private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/reddit/patches/RedgifsPlaybackPatch;"
 
@@ -60,9 +64,9 @@ private val COMPATIBILITY_REDDIT_2026_34 = Compatibility(
         AppTarget(
             version = "2026.34.0",
             minSdk = 28,
-            isExperimental = true
+            isExperimental = true,
         )
-    )
+    ),
 )
 
 private fun parameterWidth(type: CharSequence): Int =
@@ -75,21 +79,17 @@ private fun MutableMethod.declaredParameterRegister(index: Int): Int {
     require(index in parameterTypes.indices) {
         "Parameter index $index is outside $name(${parameterTypes.joinToString()})"
     }
-
     val implementation = implementation ?: error("Method $name has no implementation")
     val isStatic = AccessFlags.STATIC.isSet(accessFlags)
     val declaredParameterWords = parameterTypes.sumOf { parameterWidth(it) }
     val parameterAreaWords = declaredParameterWords + if (isStatic) 0 else 1
     val parameterAreaStart = implementation.registerCount - parameterAreaWords
     val precedingDeclaredWords = parameterTypes.take(index).sumOf { parameterWidth(it) }
-
     return parameterAreaStart + if (isStatic) precedingDeclaredWords else 1 + precedingDeclaredWords
 }
 
 private fun MutableMethod.instanceRegister(): Int {
-    require(!AccessFlags.STATIC.isSet(accessFlags)) {
-        "Method $name has no instance register"
-    }
+    require(!AccessFlags.STATIC.isSet(accessFlags)) { "Method $name has no instance register" }
     return declaredParameterRegister(0) - 1
 }
 
@@ -136,7 +136,7 @@ private fun invokeStaticTwoRegisters(
 @Suppress("unused")
 val fixRedgifsFeedAudioPatch = bytecodePatch(
     name = "Fix RedGIFs feed audio",
-    description = "Uses live RedGIFs media in Reddit's native player and enables normal audio controls.",
+    description = "Routes RedGIFs into Reddit's native MediaSource before playback so native audio tracks and controls are preserved.",
     default = false,
 ) {
     compatibleWith(COMPATIBILITY_REDDIT_2026_34)
@@ -144,18 +144,95 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
     extendWith("extensions/reddit.mpe")
 
     execute {
+        val videoMediaFragmentClass = mutableClassDefBy(VIDEO_MEDIA_FRAGMENT_CLASS)
+        val videoMediaFragmentConstructors = videoMediaFragmentClass.methods.filter { method ->
+            method.name == "<init>" &&
+                method.parameterTypes.map { it.toString() } == listOf(
+                    "Ljava/lang/String;",
+                    "Ljava/lang/String;",
+                    "Lfim0;",
+                    "Leim0;",
+                ) &&
+                method.returnType == "V"
+        }
+        require(videoMediaFragmentConstructors.size == 1) {
+            "Expected exactly one VideoMediaFragment constructor, found ${videoMediaFragmentConstructors.size}"
+        }
+        val videoMediaFragmentConstructor = videoMediaFragmentConstructors.single()
+        val videoMediaFragmentInstructions =
+            videoMediaFragmentConstructor.implementation?.instructions?.toList()
+                ?: error("VideoMediaFragment constructor has no implementation")
+        val videoMediaReturnSites = videoMediaFragmentInstructions.mapIndexedNotNull { index, instruction ->
+            index.takeIf { instruction.opcode == Opcode.RETURN_VOID }
+        }
+        require(videoMediaReturnSites.size == 1) {
+            "Expected exactly one VideoMediaFragment constructor return"
+        }
+        val embedHtmlRegister = videoMediaFragmentConstructor.declaredParameterRegister(0)
+        val fragmentUrlRegister = videoMediaFragmentConstructor.declaredParameterRegister(1)
+        require(fragmentUrlRegister == embedHtmlRegister + 1) {
+            "VideoMediaFragment embedHtml/url registers are not contiguous"
+        }
+        videoMediaFragmentConstructor.addInstructions(
+            videoMediaReturnSites.single(),
+            listOf(
+                invokeStaticRange(
+                    "prewarmRedgifs",
+                    listOf("Ljava/lang/String;", "Ljava/lang/String;"),
+                    "V",
+                    embedHtmlRegister,
+                    2,
+                ),
+            ),
+        )
+
+        val onCellGroupClass = mutableClassDefBy(ON_CELL_GROUP_FRAGMENT_CLASS)
+        val onCellGroupConstructors = onCellGroupClass.methods.filter { method ->
+            method.name == "<init>" &&
+                method.parameterTypes.map { it.toString() } == listOf(
+                    "Ljava/lang/String;",
+                    "Ljava/lang/String;",
+                    "Ljava/lang/String;",
+                    "Ljava/util/List;",
+                    CELL_GROUP_FRAGMENT_CLASS,
+                ) &&
+                method.returnType == "V"
+        }
+        require(onCellGroupConstructors.size == 1) {
+            "Expected exactly one OnCellGroupFragment constructor, found ${onCellGroupConstructors.size}"
+        }
+        val onCellGroupConstructor = onCellGroupConstructors.single()
+        val onCellGroupInstructions = onCellGroupConstructor.implementation?.instructions?.toList()
+            ?: error("OnCellGroupFragment constructor has no implementation")
+        val onCellGroupReturns = onCellGroupInstructions.mapIndexedNotNull { index, instruction ->
+            index.takeIf { instruction.opcode == Opcode.RETURN_VOID }
+        }
+        require(onCellGroupReturns.size == 1) {
+            "Expected exactly one OnCellGroupFragment constructor return"
+        }
+        val cellGroupRegister = onCellGroupConstructor.declaredParameterRegister(4)
+        onCellGroupConstructor.addInstructions(
+            onCellGroupReturns.single(),
+            listOf(
+                invokeStaticRange(
+                    "registerCellGroup",
+                    listOf("Ljava/lang/Object;"),
+                    "V",
+                    cellGroupRegister,
+                    1,
+                ),
+            ),
+        )
+
         val mapperClass = mutableClassDefBy(GRAPHQL_MAPPER_CLASS)
         val mapper = mapperClass.methods.singleOrNull { method ->
             method.name == "toRedditVideo" &&
-                method.parameterTypes.map { it.toString() } ==
-                listOf(GRAPHQL_MEDIA_FRAGMENT_CLASS) &&
+                method.parameterTypes.map { it.toString() } == listOf(GRAPHQL_MEDIA_FRAGMENT_CLASS) &&
                 method.returnType == REDDIT_VIDEO_CLASS
         } ?: error("Could not find GraphQL MediaFragment to RedditVideo mapper")
-
         require(AccessFlags.STATIC.isSet(mapper.accessFlags)) {
             "Expected GraphQL MediaFragment to RedditVideo mapper to be static"
         }
-
         val mapperInstructions = mapper.implementation?.instructions?.toList()
             ?: error("GraphQL RedditVideo mapper has no implementation")
         val fragmentRegister = mapper.declaredParameterRegister(0)
@@ -165,11 +242,7 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
                 ?: error("Unexpected return-object instruction in RedditVideo mapper")
             index to register
         }
-
-        require(returnSites.isNotEmpty()) {
-            "GraphQL RedditVideo mapper has no return-object sites"
-        }
-
+        require(returnSites.isNotEmpty()) { "GraphQL RedditVideo mapper has no return-object sites" }
         returnSites.asReversed().forEach { (index, resultRegister) ->
             mapper.addInstructions(
                 index,
@@ -192,96 +265,113 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
             )
         }
 
-        /*
-         * Reddit can reconstruct a post entirely from its Room `link` cache without running
-         * the GraphQL MediaFragment mapper. LinkDataModel (`nmr`) stores the complete
-         * serialized Link in its third constructor argument (`linkJson`).
-         */
-        val linkDataModelClass = mutableClassDefBy(LINK_DATA_MODEL_CLASS)
-        val linkDataModelConstructorParameters = listOf(
-            "Ljava/lang/String;",
-            "I",
-            "Ljava/lang/String;",
-            "J",
-            "Ljava/lang/String;",
-            "Ljava/lang/String;",
-            "Z",
-            "Ljava/lang/String;",
-            "Z",
-            "Z",
-            "Z",
-            "Ljava/lang/String;",
-        )
-        val linkDataModelConstructors = linkDataModelClass.methods.filter { method ->
-            method.name == "<init>" &&
-                method.parameterTypes.map { it.toString() } ==
-                linkDataModelConstructorParameters &&
-                method.returnType == "V"
-        }
+        data class CachedLinkVideoMethod(val classType: String, val methodName: String)
+        val cachedLinkVideoCandidates = mutableListOf<CachedLinkVideoMethod>()
+        classDefForEach { classDef ->
+            classDef.methods.forEach methodLoop@{ method ->
+                if (
+                    method.parameterTypes.map { it.toString() } != listOf(
+                        "Lcom/reddit/domain/model/Link;",
+                        "I",
+                        "Z",
+                    ) ||
+                    method.returnType != "Lmgm0;"
+                ) return@methodLoop
 
-        require(linkDataModelConstructors.size == 1) {
-            "Expected exactly one LinkDataModel constructor, found ${linkDataModelConstructors.size}"
+                val instructions = method.implementation?.instructions ?: return@methodLoop
+                val references = instructions.mapNotNull { instruction ->
+                    (instruction as? ReferenceInstruction)?.reference?.toString()
+                }
+                if (
+                    references.count {
+                        it == "Lcom/reddit/domain/model/Link;->getUrl()Ljava/lang/String;"
+                    } == 1 &&
+                    references.count {
+                        it == "Lcom/reddit/domain/model/Preview;->getRedditVideoPreview()" +
+                            "Lcom/reddit/domain/model/RedditVideo;"
+                    } == 1 &&
+                    references.count {
+                        it == "$REDDIT_VIDEO_CLASS->getDashUrl()Ljava/lang/String;"
+                    } == 1
+                ) {
+                    cachedLinkVideoCandidates += CachedLinkVideoMethod(classDef.type, method.name)
+                }
+            }
         }
-
-        val linkDataModelConstructor = linkDataModelConstructors.single()
-        require(!AccessFlags.STATIC.isSet(linkDataModelConstructor.accessFlags)) {
-            "Expected LinkDataModel constructor to be an instance method"
+        require(cachedLinkVideoCandidates.size == 1) {
+            "Expected exactly one cached Link -> video element mapper, found ${cachedLinkVideoCandidates.size}"
         }
-
-        val linkDataModelInstructions =
-            linkDataModelConstructor.implementation?.instructions?.toList()
-                ?: error("LinkDataModel constructor has no implementation")
-        val linkDataModelReturnSites = linkDataModelInstructions.mapIndexedNotNull { index, instruction ->
-            if (instruction.opcode == Opcode.RETURN_VOID) index else null
+        val cachedCandidate = cachedLinkVideoCandidates.single()
+        val cachedLinkVideoClass = mutableClassDefBy(cachedCandidate.classType)
+        val cachedLinkVideoMethod = cachedLinkVideoClass.methods.single { method ->
+            method.name == cachedCandidate.methodName &&
+                method.parameterTypes.map { it.toString() } == listOf(
+                    "Lcom/reddit/domain/model/Link;", "I", "Z"
+                ) &&
+                method.returnType == "Lmgm0;"
         }
-
-        require(linkDataModelReturnSites.size == 1) {
-            "Expected exactly one LinkDataModel constructor return, found ${linkDataModelReturnSites.size}"
+        val cachedImpl = cachedLinkVideoMethod.implementation
+            ?: error("Cached Link -> video element mapper has no implementation")
+        require(cachedImpl.registerCount == 34) {
+            "Unexpected cached Link -> video element mapper register count ${cachedImpl.registerCount}"
         }
-
-        val linkJsonRegister = linkDataModelConstructor.declaredParameterRegister(2)
-        linkDataModelConstructor.addInstructions(
-            linkDataModelReturnSites.single(),
-            listOf(
-                invokeStaticRange(
-                    "registerCachedLinkJson",
-                    listOf("Ljava/lang/String;"),
-                    "V",
-                    linkJsonRegister,
-                    1,
-                ),
-            ),
+        val cachedInstructions = cachedImpl.instructions.toList()
+        fun cachedReference(index: Int): String? =
+            (cachedInstructions[index] as? ReferenceInstruction)?.reference?.toString()
+        val dashInvokeIndices = cachedInstructions.indices.filter { index ->
+            cachedReference(index) == "$REDDIT_VIDEO_CLASS->getDashUrl()Ljava/lang/String;"
+        }
+        require(dashInvokeIndices.size == 1) {
+            "Expected exactly one RedditVideo.getDashUrl call in cached Link mapper"
+        }
+        val dashInvokeIndex = dashInvokeIndices.single()
+        require(dashInvokeIndex + 5 < cachedInstructions.size) {
+            "Cached Link mapper ends unexpectedly after getDashUrl"
+        }
+        val dashResult = cachedInstructions[dashInvokeIndex + 1] as? OneRegisterInstruction
+            ?: error("Unexpected getDashUrl result instruction")
+        val widthResult = cachedInstructions[dashInvokeIndex + 3] as? OneRegisterInstruction
+            ?: error("Unexpected getWidth result instruction")
+        val heightResult = cachedInstructions[dashInvokeIndex + 5] as? OneRegisterInstruction
+            ?: error("Unexpected getHeight result instruction")
+        require(
+            cachedInstructions[dashInvokeIndex].opcode == Opcode.INVOKE_VIRTUAL &&
+                cachedInstructions[dashInvokeIndex + 1].opcode == Opcode.MOVE_RESULT_OBJECT &&
+                dashResult.registerA == 13 &&
+                cachedReference(dashInvokeIndex + 2) == "$REDDIT_VIDEO_CLASS->getWidth()I" &&
+                cachedInstructions[dashInvokeIndex + 3].opcode == Opcode.MOVE_RESULT &&
+                widthResult.registerA == 14 &&
+                cachedReference(dashInvokeIndex + 4) == "$REDDIT_VIDEO_CLASS->getHeight()I" &&
+                cachedInstructions[dashInvokeIndex + 5].opcode == Opcode.MOVE_RESULT &&
+                heightResult.registerA == 15
+        ) { "Unexpected cached Link mapper layout around RedditVideo.getDashUrl" }
+        cachedLinkVideoMethod.addInstructions(
+            dashInvokeIndex + 2,
+            """
+                invoke-virtual {v0}, Lcom/reddit/domain/model/Link;->getUrl()Ljava/lang/String;
+                move-result-object v14
+                move-object v15, v13
+                invoke-static/range {v14 .. v15}, $EXTENSION_CLASS->registerCachedRedgifs(Ljava/lang/String;Ljava/lang/String;)V
+            """.trimIndent(),
         )
 
         val redditVideoClass = mutableClassDefBy(REDDIT_VIDEO_CLASS)
         val gifGetters = redditVideoClass.methods.filter { method ->
-            method.name == "isGif" &&
-                method.parameterTypes.isEmpty() &&
-                method.returnType == "Z"
+            method.name == "isGif" && method.parameterTypes.isEmpty() && method.returnType == "Z"
         }
-
         require(gifGetters.size == 1) {
             "Expected exactly one RedditVideo.isGif getter, found ${gifGetters.size}"
         }
-
         val gifGetter = gifGetters.single()
-        require(!AccessFlags.STATIC.isSet(gifGetter.accessFlags)) {
-            "Expected RedditVideo.isGif to be an instance method"
-        }
-
         val gifGetterImplementation = gifGetter.implementation
             ?: error("RedditVideo.isGif has no implementation")
         val gifGetterInstructions = gifGetterImplementation.instructions.toList()
         val originalInstanceRegister = gifGetterImplementation.registerCount - 1
-
         require(
             gifGetterInstructions.size == 2 &&
                 gifGetterInstructions[0].opcode == Opcode.IGET_BOOLEAN &&
                 gifGetterInstructions[1].opcode == Opcode.RETURN
-        ) {
-            "Unsupported RedditVideo.isGif implementation for Reddit 2026.34"
-        }
-
+        ) { "Unsupported RedditVideo.isGif implementation for Reddit 2026.34" }
         val gifFieldRead = gifGetterInstructions[0] as? TwoRegisterInstruction
             ?: error("Unexpected RedditVideo.isGif field read")
         val gifReturn = gifGetterInstructions[1] as? OneRegisterInstruction
@@ -289,21 +379,13 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
         val gifBackingField =
             (gifGetterInstructions[0] as? ReferenceInstruction)?.reference as? FieldReference
                 ?: error("Could not resolve RedditVideo.isGif backing field")
-
         require(
             gifFieldRead.registerA == gifReturn.registerA &&
                 gifFieldRead.registerB == originalInstanceRegister &&
                 gifBackingField.definingClass == REDDIT_VIDEO_CLASS &&
                 gifBackingField.type == "Z"
-        ) {
-            "Unexpected RedditVideo.isGif register or field layout"
-        }
+        ) { "Unexpected RedditVideo.isGif register or field layout" }
 
-        /*
-         * Reddit 2026.34 uses a one-register Kotlin backing-field getter where p0 is both
-         * `this` and the result register. Rebuild it with one local so Reddit's original
-         * boolean is preserved and only registered RedGIFs transform true -> false.
-         */
         val replacementGifGetter = ImmutableMethod(
             gifGetter.definingClass,
             gifGetter.name,
@@ -314,16 +396,10 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
             gifGetter.hiddenApiRestrictions,
             MutableMethodImplementation(2),
         ).toMutable()
-
         replacementGifGetter.addInstructions(
             0,
             listOf(
-                BuilderInstruction22c(
-                    Opcode.IGET_BOOLEAN,
-                    0,
-                    1,
-                    gifBackingField,
-                ),
+                BuilderInstruction22c(Opcode.IGET_BOOLEAN, 0, 1, gifBackingField),
                 invokeStaticRange(
                     "overrideIsGif",
                     listOf("Z", "Ljava/lang/Object;"),
@@ -335,7 +411,6 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
                 BuilderInstruction11x(Opcode.RETURN, 0),
             ),
         )
-
         require(redditVideoClass.methods.remove(gifGetter)) {
             "Could not remove original RedditVideo.isGif getter"
         }
@@ -343,200 +418,142 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
             "Could not add replacement RedditVideo.isGif getter"
         }
 
-        val videoPropsClass = mutableClassDefBy(VIDEO_PROPS_CLASS)
-        val constructors = videoPropsClass.methods.filter { method ->
-            method.name == "<init>" &&
-                method.parameterTypes.firstOrNull()?.toString() == "Ljava/lang/String;" &&
-                method.parameterTypes.getOrNull(1)?.toString() == PLAYBACK_KEY_CLASS
+        val playbackControllerClass = mutableClassDefBy(PLAYBACK_CONTROLLER_CLASS)
+        val provideMediaSourceMethods = playbackControllerClass.methods.filter { method ->
+            method.name == "d" &&
+                method.parameterTypes.map { it.toString() } == listOf(
+                    MEDIA_SOURCE_REPOSITORY_CLASS,
+                    "Ljava/lang/String;",
+                    CONTINUATION_IMPL_CLASS,
+                ) &&
+                method.returnType == "Ljava/lang/Object;"
         }
-
-        require(constructors.size == 1) {
-            "Expected exactly one VideoProps(String, PlaybackKey, ...) constructor, found ${constructors.size}"
+        require(provideMediaSourceMethods.size == 1) {
+            "Expected exactly one PlaybackController.provideMediaSource method, found ${provideMediaSourceMethods.size}"
         }
-
-        val constructor = constructors.single()
-        val constructorInstructions = constructor.implementation?.instructions?.toList()
-            ?: error("VideoProps constructor has no implementation")
-        val superCallIndex = constructorInstructions.indexOfFirst { instruction ->
-            if (instruction.opcode != Opcode.INVOKE_DIRECT &&
-                instruction.opcode != Opcode.INVOKE_DIRECT_RANGE) {
-                return@indexOfFirst false
-            }
-
-            val reference =
-                (instruction as? ReferenceInstruction)?.reference as? MethodReference
-                    ?: return@indexOfFirst false
-
-            reference.name == "<init>" && reference.definingClass == videoPropsClass.superclass
-        }
-
-        require(superCallIndex >= 0) {
-            "Could not locate VideoProps superclass constructor call"
-        }
-
-        val urlRegister = constructor.declaredParameterRegister(0)
-        require(urlRegister <= 0xff) {
-            "VideoProps URL parameter register v$urlRegister cannot receive an object result"
-        }
-
-        constructor.addInstructions(
-            superCallIndex + 1,
+        val provideMediaSource = provideMediaSourceMethods.single()
+        val playbackUrlRegister = provideMediaSource.declaredParameterRegister(1)
+        provideMediaSource.addInstructions(
+            0,
             listOf(
                 invokeStaticRange(
                     "rewritePlaybackUrl",
                     listOf("Ljava/lang/String;"),
                     "Ljava/lang/String;",
-                    urlRegister,
+                    playbackUrlRegister,
                     1,
                 ),
-                BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, urlRegister),
+                BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, playbackUrlRegister),
             ),
         )
 
-        /* Commit the route on the real ProgressiveMediaPeriod. Every l150 loadable
-         * created for seeks, retries, or later loads receives the same final URI.
-         */
-        val mediaPeriodClass = mutableClassDefBy(PROGRESSIVE_MEDIA_PERIOD_CLASS)
-        val mediaPeriodConstructors = mediaPeriodClass.methods.filter { method ->
-            method.name == "<init>" &&
-                method.parameterTypes.firstOrNull()?.toString() == URI_CLASS &&
-                method.returnType == "V"
+        val repositoryClass = mutableClassDefBy(MEDIA_SOURCE_REPOSITORY_CLASS)
+        val provideSourceMethods = repositoryClass.methods.filter { method ->
+            method.name == "c" &&
+                method.parameterTypes.map { it.toString() } == listOf(
+                    MEDIA_ITEM_CLASS,
+                    PLAYER_CACHE_CONTEXT_CLASS,
+                    CONTINUATION_IMPL_CLASS,
+                ) &&
+                method.returnType == "Ljava/lang/Object;"
         }
-
-        require(mediaPeriodConstructors.size == 1) {
-            "Expected exactly one ProgressiveMediaPeriod constructor with a Uri, found " +
-                mediaPeriodConstructors.size
+        require(provideSourceMethods.size == 1) {
+            "Expected exactly one RedditMediaSourceRepository.provideMediaSource method, found ${provideSourceMethods.size}"
         }
+        val provideSource = provideSourceMethods.single()
+        val repositoryInstructions = provideSource.implementation?.instructions?.toList()
+            ?: error("RedditMediaSourceRepository.provideMediaSource has no implementation")
 
-        val mediaPeriodConstructor = mediaPeriodConstructors.single()
-        val mediaPeriodConstructorInstructions =
-            mediaPeriodConstructor.implementation?.instructions?.toList()
-                ?: error("ProgressiveMediaPeriod constructor has no implementation")
-        val mediaPeriodSuperCallIndex = mediaPeriodConstructorInstructions.indexOfFirst { instruction ->
-            if (instruction.opcode != Opcode.INVOKE_DIRECT &&
-                instruction.opcode != Opcode.INVOKE_DIRECT_RANGE) {
-                return@indexOfFirst false
-            }
-
-            val reference =
-                (instruction as? ReferenceInstruction)?.reference as? MethodReference
-                    ?: return@indexOfFirst false
-
-            reference.name == "<init>" && reference.definingClass == mediaPeriodClass.superclass
+        val validationInvokes = repositoryInstructions.mapIndexedNotNull { index, instruction ->
+            val reference = (instruction as? ReferenceInstruction)?.reference as? MethodReference
+                ?: return@mapIndexedNotNull null
+            if (
+                instruction.opcode == Opcode.INVOKE_STATIC &&
+                reference.toString() ==
+                    "Lk9p0;->l0(Lcom/reddit/features/Vp9ExpansionVariant;)Z"
+            ) index else null
         }
-
-        require(mediaPeriodSuperCallIndex >= 0) {
-            "Could not locate ProgressiveMediaPeriod superclass constructor call"
+        require(validationInvokes.size == 1) {
+            "Expected exactly one VP9 cache URI validation gate, found ${validationInvokes.size}"
         }
+        val validationInvokeIndex = validationInvokes.single()
 
-        val mediaPeriodRegister = mediaPeriodConstructor.instanceRegister()
-        val periodUriRegister = mediaPeriodConstructor.declaredParameterRegister(0)
-        require(periodUriRegister == mediaPeriodRegister + 1) {
-            "ProgressiveMediaPeriod instance and Uri registers are not contiguous"
+        val requestedUriReads = repositoryInstructions.mapIndexedNotNull { index, instruction ->
+            if (index >= validationInvokeIndex) return@mapIndexedNotNull null
+            val reference = (instruction as? ReferenceInstruction)?.reference as? FieldReference
+                ?: return@mapIndexedNotNull null
+            if (
+                instruction.opcode == Opcode.IGET_OBJECT &&
+                reference.definingClass == "Ljit;" &&
+                reference.name == "a" &&
+                reference.type == URI_CLASS
+            ) index else null
         }
-        require(periodUriRegister <= 0xff) {
-            "ProgressiveMediaPeriod Uri register v$periodUriRegister cannot receive an object result"
+        require(requestedUriReads.size == 1) {
+            "Expected exactly one requested MediaItem URI read before the cache gate, found ${requestedUriReads.size}"
         }
+        val requestedUriInstruction =
+            repositoryInstructions[requestedUriReads.single()] as? TwoRegisterInstruction
+                ?: error("Unexpected requested URI field read")
+        val requestedUriRegister = requestedUriInstruction.registerA
 
-        mediaPeriodConstructor.addInstructions(
-            mediaPeriodSuperCallIndex + 1,
+        val validationMoveIndex = validationInvokeIndex + 1
+        require(validationMoveIndex < repositoryInstructions.size &&
+            repositoryInstructions[validationMoveIndex].opcode == Opcode.MOVE_RESULT) {
+            "Unexpected instruction after VP9 cache URI validation gate"
+        }
+        val validationRegister =
+            (repositoryInstructions[validationMoveIndex] as? OneRegisterInstruction)?.registerA
+                ?: error("Could not read cache validation result register")
+        require(validationRegister <= 0xf && requestedUriRegister <= 0xf) {
+            "Cache validation hook registers do not fit invoke-static"
+        }
+        provideSource.addInstructions(
+            validationMoveIndex + 1,
             listOf(
-                invokeStaticRange(
-                    "resolvePeriodUri",
-                    listOf("Ljava/lang/Object;", "Ljava/lang/Object;"),
-                    "Ljava/lang/Object;",
-                    mediaPeriodRegister,
-                    2,
+                invokeStaticTwoRegisters(
+                    "forceCacheUriValidation",
+                    listOf("Z", "Ljava/lang/Object;"),
+                    "Z",
+                    validationRegister,
+                    requestedUriRegister,
                 ),
-                BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, periodUriRegister),
-                BuilderInstruction21c(
-                    Opcode.CHECK_CAST,
-                    periodUriRegister,
-                    ImmutableTypeReference(URI_CLASS),
-                ),
+                BuilderInstruction11x(Opcode.MOVE_RESULT, validationRegister),
             ),
         )
 
-        /*
-         * l150.a(long, String) constructs every DataSpec from the already-fixed period
-         * URI. Pass its owning period so headers and cache identity come from the same
-         * immutable PeriodRoute without a global URL lookup.
-         */
         val loadableClass = mutableClassDefBy(PROGRESSIVE_LOADABLE_CLASS)
-        val outerPeriodFields = loadableClass.fields.filter { field ->
-            field.type == PROGRESSIVE_MEDIA_PERIOD_CLASS &&
-                AccessFlags.SYNTHETIC.isSet(field.accessFlags) &&
-                !AccessFlags.STATIC.isSet(field.accessFlags)
-        }
-        require(outerPeriodFields.size == 1) {
-            "Expected exactly one ProgressiveMediaPeriod field on l150, found " +
-                outerPeriodFields.size
-        }
-        val outerPeriodField = outerPeriodFields.single()
-
         val dataSpecBuilders = loadableClass.methods.filter { method ->
             method.name == "a" &&
-                method.parameterTypes.map { it.toString() } ==
-                listOf("J", "Ljava/lang/String;") &&
+                method.parameterTypes.map { it.toString() } == listOf("J", "Ljava/lang/String;") &&
                 method.returnType == DATA_SPEC_CLASS
         }
-
         require(dataSpecBuilders.size == 1) {
-            "Expected exactly one l150 DataSpec builder, found " +
-                dataSpecBuilders.size
+            "Expected exactly one l150 DataSpec builder, found ${dataSpecBuilders.size}"
         }
-
         val dataSpecBuilder = dataSpecBuilders.single()
-        val loadableRegister = dataSpecBuilder.instanceRegister()
-        val dataSpecBuilderInstructions = dataSpecBuilder.implementation?.instructions?.toList()
-            ?: error("ProgressiveMediaPeriod DataSpec builder has no implementation")
-        val loadableLocalRegister = dataSpecBuilderInstructions.firstNotNullOfOrNull { instruction ->
-            if (instruction.opcode != Opcode.MOVE_OBJECT &&
-                instruction.opcode != Opcode.MOVE_OBJECT_FROM16 &&
-                instruction.opcode != Opcode.MOVE_OBJECT_16) {
-                return@firstNotNullOfOrNull null
-            }
-            val move = instruction as? TwoRegisterInstruction
-                ?: return@firstNotNullOfOrNull null
-            move.registerA.takeIf { move.registerB == loadableRegister && it <= 0xf }
-        } ?: error("Could not locate l150's low-register copy of this")
-        val dataSpecReturnSites = dataSpecBuilderInstructions.mapIndexedNotNull { index, instruction ->
+        val dataSpecInstructions = dataSpecBuilder.implementation?.instructions?.toList()
+            ?: error("l150 DataSpec builder has no implementation")
+        val dataSpecReturns = dataSpecInstructions.mapIndexedNotNull { index, instruction ->
             if (instruction.opcode != Opcode.RETURN_OBJECT) return@mapIndexedNotNull null
             val register = (instruction as? OneRegisterInstruction)?.registerA
-                ?: error("Unexpected return-object instruction in DataSpec builder")
+                ?: error("Unexpected DataSpec return-object instruction")
             index to register
         }
-
-        require(dataSpecReturnSites.isNotEmpty()) {
-            "ProgressiveMediaPeriod DataSpec builder has no return-object sites"
-        }
-
-        dataSpecReturnSites.asReversed().forEach { (index, dataSpecRegister) ->
-            val periodScratchRegister = (0..0xf).firstOrNull { register ->
-                register != loadableLocalRegister && register != dataSpecRegister
-            } ?: error("Could not reserve a low scratch register for l150 DataSpec hook")
-            require(dataSpecRegister <= 0xf) {
-                "l150 DataSpec result register does not fit invoke-static"
+        require(dataSpecReturns.isNotEmpty()) { "l150 DataSpec builder has no return-object sites" }
+        dataSpecReturns.asReversed().forEach { (index, dataSpecRegister) ->
+            require(dataSpecRegister <= 0xff) {
+                "l150 DataSpec result register v$dataSpecRegister cannot receive check-cast"
             }
             dataSpecBuilder.addInstructions(
                 index,
                 listOf(
-                    BuilderInstruction22c(
-                        Opcode.IGET_OBJECT,
-                        periodScratchRegister,
-                        loadableLocalRegister,
-                        ImmutableFieldReference(
-                            PROGRESSIVE_LOADABLE_CLASS,
-                            outerPeriodField.name,
-                            PROGRESSIVE_MEDIA_PERIOD_CLASS,
-                        ),
-                    ),
-                    invokeStaticTwoRegisters(
+                    invokeStaticRange(
                         "prepareDataSpec",
-                        listOf("Ljava/lang/Object;", "Ljava/lang/Object;"),
+                        listOf("Ljava/lang/Object;"),
                         "Ljava/lang/Object;",
-                        periodScratchRegister,
                         dataSpecRegister,
+                        1,
                     ),
                     BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, dataSpecRegister),
                     BuilderInstruction21c(
