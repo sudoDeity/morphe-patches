@@ -7,6 +7,7 @@
 
 package app.morphe.extension.reddit.patches;
 
+import android.os.Looper;
 import android.util.Log;
 
 import java.lang.reflect.Field;
@@ -26,14 +27,17 @@ import java.util.regex.Pattern;
 /**
  * Diagnostic-only facade for the aggressive minimal RedGIFs A/B build.
  *
- * This class deliberately does not implement playback logic. Every public entry point delegates
- * to {@link RedgifsPlaybackPatch} first and only observes the patch's own state afterwards.
+ * <p>This class never implements playback decisions. Every public entry point delegates to
+ * {@link RedgifsPlaybackPatch} first and observes state afterwards. Expensive state dumps are
+ * deliberately kept off Reddit's calling thread and coalesced so diagnostics cannot stall the
+ * UI/feed mapper.</p>
  */
 @SuppressWarnings({"unused", "unchecked"})
 public final class RedgifsDebug {
     private static final String TAG = "MorpheRedgifs";
     private static final AtomicLong EVENT_SEQUENCE = new AtomicLong();
-    private static final int MAX_DUMP_ENTRIES = 12;
+    private static final AtomicLong WATCH_GENERATION = new AtomicLong();
+    private static final int MAX_DUMP_ENTRIES = 6;
 
     private static final ScheduledThreadPoolExecutor WATCHER =
             new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
@@ -47,8 +51,8 @@ public final class RedgifsDebug {
 
     static {
         WATCHER.setRemoveOnCancelPolicy(true);
-        log("BOOT debugger=enabled minimalCore=true");
-        dumpState("BOOT");
+        log("BOOT debugger=enabled minimalCore=true mode=nonblocking");
+        scheduleWatch("BOOT");
     }
 
     private RedgifsDebug() {
@@ -56,12 +60,15 @@ public final class RedgifsDebug {
 
     public static void captureMediaFragment(Object mediaFragment) {
         long event = EVENT_SEQUENCE.incrementAndGet();
-        log("CAPTURE begin id=" + event + " fragment=" + className(mediaFragment));
+        log("CAPTURE begin id=" + event +
+                " thread=" + threadLabel() +
+                " fragment=" + className(mediaFragment));
+
         RedgifsPlaybackPatch.captureMediaFragment(mediaFragment);
 
         Object pending = threadLocalValue("PENDING_REDGIFS_SLUG");
-        log("CAPTURE end id=" + event + " pendingSlug=" + value(pending));
-        dumpState("CAPTURE#" + event);
+        log("CAPTURE end id=" + event +
+                " pendingSlug=" + value(pending));
         scheduleWatch("CAPTURE#" + event);
     }
 
@@ -70,6 +77,7 @@ public final class RedgifsDebug {
         String mediaIdBefore = redditVideoMediaId(redditVideo);
         Object pendingBefore = threadLocalValue("PENDING_REDGIFS_SLUG");
         log("REGISTER begin id=" + event +
+                " thread=" + threadLabel() +
                 " video=" + className(redditVideo) +
                 " mediaId=" + value(mediaIdBefore) +
                 " pendingSlug=" + value(pendingBefore));
@@ -84,7 +92,6 @@ public final class RedgifsDebug {
                 " slug=" + value(slug) +
                 " conflicted=" + conflicted +
                 " pendingAfter=" + value(pendingAfter));
-        dumpState("REGISTER#" + event);
         scheduleWatch("REGISTER#" + event);
     }
 
@@ -93,7 +100,7 @@ public final class RedgifsDebug {
         String mediaId = mediaIdFromUrl(currentUrl);
         String slugBefore = mediaId == null ? null : mediaToSlug().get(mediaId);
         log("REWRITE begin id=" + event +
-                " thread=" + Thread.currentThread().getName() +
+                " thread=" + threadLabel() +
                 " mediaId=" + value(mediaId) +
                 " slug=" + value(slugBefore) +
                 " in=" + safeUrl(currentUrl));
@@ -114,11 +121,11 @@ public final class RedgifsDebug {
         if (!changed) {
             logRewriteFallbackReason(event, currentUrl, mediaId, slugAfter);
         }
-        dumpState("REWRITE#" + event);
         scheduleWatch("REWRITE#" + event);
         return result;
     }
 
+    /** Expensive diagnostic snapshot. Call only from the dedicated watcher thread. */
     public static void dumpState(String reason) {
         try {
             Map<String, String> identities = mediaToSlug();
@@ -129,6 +136,8 @@ public final class RedgifsDebug {
             Object token = staticField("temporaryToken");
 
             log("STATE reason=" + reason +
+                    " thread=" + threadLabel() +
+                    " events=" + EVENT_SEQUENCE.get() +
                     " identities=" + identities.size() +
                     " conflicts=" + conflicts.size() +
                     " resolutions=" + resolutions.size() +
@@ -141,7 +150,8 @@ public final class RedgifsDebug {
             int count = 0;
             for (Map.Entry<String, String> entry : identities.entrySet()) {
                 if (count++ >= MAX_DUMP_ENTRIES) {
-                    log("IDENTITY_MAP truncated remaining=" + (identities.size() - MAX_DUMP_ENTRIES));
+                    log("IDENTITY_MAP truncated remaining=" +
+                            Math.max(0, identities.size() - MAX_DUMP_ENTRIES));
                     break;
                 }
                 log("IDENTITY_MAP mediaId=" + entry.getKey() +
@@ -152,7 +162,8 @@ public final class RedgifsDebug {
             count = 0;
             for (Map.Entry<String, Object> entry : resolutions.entrySet()) {
                 if (count++ >= MAX_DUMP_ENTRIES) {
-                    log("RESOLUTION truncated remaining=" + (resolutions.size() - MAX_DUMP_ENTRIES));
+                    log("RESOLUTION truncated remaining=" +
+                            Math.max(0, resolutions.size() - MAX_DUMP_ENTRIES));
                     break;
                 }
                 dumpResolution(entry.getKey(), entry.getValue());
@@ -203,7 +214,8 @@ public final class RedgifsDebug {
         }
     }
 
-    private static void logRewriteFallbackReason(long event, String url, String mediaId, String slug) {
+    private static void logRewriteFallbackReason(long event, String url, String mediaId,
+                                                  String slug) {
         if (url == null || url.isEmpty()) {
             log("REWRITE miss id=" + event + " reason=empty_url");
             return;
@@ -217,7 +229,8 @@ public final class RedgifsDebug {
             return;
         }
         if (conflictedMediaIds().contains(mediaId)) {
-            log("REWRITE miss id=" + event + " reason=conflicted_identity mediaId=" + mediaId);
+            log("REWRITE miss id=" + event +
+                    " reason=conflicted_identity mediaId=" + mediaId);
             return;
         }
         if (slug == null) {
@@ -244,12 +257,18 @@ public final class RedgifsDebug {
         }
     }
 
+    /**
+     * Coalesce bursts of GraphQL mapper events. Every event advances the generation; stale tasks
+     * exit without reflection or log output. Only the final quiet point produces full snapshots.
+     */
     private static void scheduleWatch(final String reason) {
-        final long[] delaysMs = {50L, 150L, 400L, 900L, 1800L, 3500L};
+        final long generation = WATCH_GENERATION.incrementAndGet();
+        final long[] delaysMs = {200L, 800L, 2000L};
         for (final long delay : delaysMs) {
             WATCHER.schedule(new Runnable() {
                 @Override
                 public void run() {
+                    if (WATCH_GENERATION.get() != generation) return;
                     dumpState(reason + "+" + delay + "ms");
                 }
             }, delay, TimeUnit.MILLISECONDS);
@@ -314,6 +333,11 @@ public final class RedgifsDebug {
     private static long nanosUntil(long now, long deadline) {
         if (deadline <= 0) return 0;
         return TimeUnit.NANOSECONDS.toMillis(Math.max(0L, deadline - now));
+    }
+
+    private static String threadLabel() {
+        return Thread.currentThread().getName() +
+                (Looper.myLooper() == Looper.getMainLooper() ? ":main" : ":bg");
     }
 
     private static String value(Object value) {
