@@ -34,7 +34,7 @@ private const val GRAPHQL_REDDIT_VIDEO_MEDIA_CLASS = "Lrgt;"
 private const val VIDEO_MEDIA_FRAGMENT_CLASS = "Lgim0;"
 private const val REDDIT_VIDEO_CLASS = "Lcom/reddit/domain/model/RedditVideo;"
 private const val EXTENSION_CLASS =
-    "Lapp/morphe/extension/reddit/patches/RedgifsPlaybackPatch;"
+    "Lapp/morphe/extension/reddit/patches/RedgifsDebug;"
 
 private const val MEDIA_FRAGMENT_INTERFACE =
     $$"Lapp/morphe/extension/reddit/patches/RedgifsPlaybackPatch$MediaFragmentInterface;"
