@@ -37,6 +37,7 @@ private const val GRAPHQL_MAPPER_CLASS =
     "Lcom/reddit/data/model/graphql/GqlDataToMediaDomainModelMapperKt;"
 private const val GRAPHQL_MEDIA_FRAGMENT_CLASS = "Lsgt;"
 private const val VIDEO_MEDIA_FRAGMENT_CLASS = "Lgim0;"
+private const val LINK_DATA_MODEL_CLASS = "Lnmr;"
 private const val ON_CELL_GROUP_FRAGMENT_CLASS = "Lety;"
 private const val CELL_GROUP_FRAGMENT_CLASS = "Lxb7;"
 private const val REDDIT_VIDEO_CLASS = "Lcom/reddit/domain/model/RedditVideo;"
@@ -182,6 +183,58 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
                     "V",
                     embedHtmlRegister,
                     2,
+                ),
+            ),
+        )
+
+        /*
+         * Room can materialize cached links before GraphQL/CellGroup identity exists.
+         * This hook never classifies a post. It only starts the resolver from the
+         * structured top-level Link.url stored in linkJson, buying the cache path the
+         * same head start as the network VideoMediaFragment constructor.
+         */
+        val linkDataModelClass = mutableClassDefBy(LINK_DATA_MODEL_CLASS)
+        val linkDataModelConstructorParameters = listOf(
+            "Ljava/lang/String;",
+            "I",
+            "Ljava/lang/String;",
+            "J",
+            "Ljava/lang/String;",
+            "Ljava/lang/String;",
+            "Z",
+            "Ljava/lang/String;",
+            "Z",
+            "Z",
+            "Z",
+            "Ljava/lang/String;",
+        )
+        val linkDataModelConstructors = linkDataModelClass.methods.filter { method ->
+            method.name == "<init>" &&
+                method.parameterTypes.map { it.toString() } == linkDataModelConstructorParameters &&
+                method.returnType == "V"
+        }
+        require(linkDataModelConstructors.size == 1) {
+            "Expected exactly one LinkDataModel constructor, found ${linkDataModelConstructors.size}"
+        }
+        val linkDataModelConstructor = linkDataModelConstructors.single()
+        val linkDataModelInstructions = linkDataModelConstructor.implementation?.instructions?.toList()
+            ?: error("LinkDataModel constructor has no implementation")
+        val linkDataModelReturns = linkDataModelInstructions.mapIndexedNotNull { index, instruction ->
+            index.takeIf { instruction.opcode == Opcode.RETURN_VOID }
+        }
+        require(linkDataModelReturns.size == 1) {
+            "Expected exactly one LinkDataModel constructor return, found ${linkDataModelReturns.size}"
+        }
+        val linkJsonRegister = linkDataModelConstructor.declaredParameterRegister(2)
+        linkDataModelConstructor.addInstructions(
+            linkDataModelReturns.single(),
+            listOf(
+                invokeStaticRange(
+                    "prewarmCachedLinkJson",
+                    listOf("Ljava/lang/String;"),
+                    "V",
+                    linkJsonRegister,
+                    1,
                 ),
             ),
         )
