@@ -13,6 +13,9 @@ import android.net.Network;
 import android.net.Uri;
 import android.os.Looper;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -121,6 +124,16 @@ public final class RedgifsPlaybackPatch {
     public static void prewarmRedgifs(String embedHtml, String url) {
         String slug = findRedgifsSlug(embedHtml, url);
         if (slug != null) startResolution(entryForSlug(slug));
+    }
+
+    public static void prewarmCachedLinkJson(String linkJson) {
+        if (linkJson == null || linkJson.isEmpty()) return;
+        try {
+            JSONObject link = new JSONObject(linkJson);
+            String slug = findFirst(REDGIFS_SLUG, link.optString("url", null));
+            if (slug != null) startResolution(entryForSlug(slug));
+        } catch (JSONException | RuntimeException ignored) {
+        }
     }
 
     public static void captureMediaFragment(Object mediaFragment) {
