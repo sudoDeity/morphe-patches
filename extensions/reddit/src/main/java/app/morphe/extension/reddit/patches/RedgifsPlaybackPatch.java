@@ -60,6 +60,7 @@ public final class RedgifsPlaybackPatch {
 
     /** Prewarm is opportunistic; actual playback requests are never rejected by this cap. */
     private static final int MAX_PENDING_PREWARMS = 32;
+    private static final int MAX_TRANSPORT_ROUTES = 256;
     private static final int MAX_RETRY_EXPONENT = 6;
     private static final long DIRECT_URL_FALLBACK_LIFETIME_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final long DIRECT_URL_EXPIRY_MARGIN_MILLIS = TimeUnit.SECONDS.toMillis(5);
@@ -102,8 +103,19 @@ public final class RedgifsPlaybackPatch {
     private static final Set<String> CONFLICTED_MEDIA_IDS = ConcurrentHashMap.newKeySet();
     private static final ConcurrentHashMap<String, ResolutionEntry> RESOLUTIONS_BY_SLUG =
             new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, ResolvedRoute> ROUTES_BY_URL =
-            new ConcurrentHashMap<>();
+
+    /**
+     * Transport metadata outlives resolver validity because an already-created MediaSource can
+     * continue issuing DataSpecs after the resolver route expires or the active network changes.
+     */
+    private static final Map<String, ResolvedRoute> ROUTES_BY_URL = Collections.synchronizedMap(
+            new LinkedHashMap<String, ResolvedRoute>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ResolvedRoute> eldest) {
+                    return size() > MAX_TRANSPORT_ROUTES;
+                }
+            }
+    );
 
     private static final AtomicLong RESOLUTION_SEQUENCE = new AtomicLong();
     private static final ThreadPoolExecutor RESOLVER = new ThreadPoolExecutor(
@@ -398,11 +410,10 @@ public final class RedgifsPlaybackPatch {
                 route.networkIdentity.equals(networkIdentity);
         if (sameNetwork && nowNanos < route.expiresAtNanos) return route;
 
+        // Only resolver ownership expires here. Transport metadata must remain available to
+        // MediaSources that were already created with this exact direct URL.
         synchronized (entry) {
-            if (entry.route == route) {
-                entry.route = null;
-                ROUTES_BY_URL.remove(route.directUrl, route);
-            }
+            if (entry.route == route) entry.route = null;
         }
         return null;
     }
@@ -434,10 +445,13 @@ public final class RedgifsPlaybackPatch {
         synchronized (entry) {
             long nowNanos = System.nanoTime();
             if (entry.terminalFailure == TerminalFailure.GIF_DELETED ||
-                    validRoute(entry, nowNanos) != null ||
-                    nowNanos < entry.nextRetryAtNanos) {
+                    validRoute(entry, nowNanos) != null) {
                 return;
             }
+
+            // Backoff protects speculative prewarm traffic. A real playback request must be
+            // allowed to retry immediately instead of inheriting an earlier prewarm failure.
+            if (!playbackPriority && nowNanos < entry.nextRetryAtNanos) return;
 
             if (entry.resolving) {
                 ResolutionTask pending = entry.pendingTask;
@@ -488,9 +502,7 @@ public final class RedgifsPlaybackPatch {
             ROUTES_BY_URL.put(published.directUrl, published);
         }
 
-        ResolvedRoute previous;
         synchronized (entry) {
-            previous = entry.route;
             entry.pendingTask = null;
             entry.resolving = false;
             if (published != null) {
@@ -509,10 +521,6 @@ public final class RedgifsPlaybackPatch {
                 entry.nextRetryAtNanos = System.nanoTime() + Math.min(delay, MAX_RETRY_DELAY_NANOS);
             }
             entry.notifyAll();
-        }
-
-        if (previous != null && previous != published) {
-            ROUTES_BY_URL.remove(previous.directUrl, previous);
         }
     }
 
