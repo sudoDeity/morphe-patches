@@ -1,0 +1,1092 @@
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches
+ *
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to this code.
+ */
+
+package app.morphe.extension.reddit.patches;
+
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.Uri;
+import android.os.Looper;
+
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import app.morphe.extension.shared.Utils;
+
+/**
+ * Resolves RedGIFs media before Reddit creates its MediaSource, so Reddit/Media3 own one
+ * consistent URI from MediaItem through MediaPeriod and track publication.
+ */
+@SuppressWarnings("unused")
+public final class RedgifsPlaybackPatch {
+    /** Stable adapter ABI implemented by target classes through injected bridge methods. */
+    public interface MediaFragmentInterface {
+        Object patch_getRedditVideoMedia();
+    }
+
+    public interface RedditVideoMediaInterface {
+        Object patch_getVideoMedia();
+    }
+
+    public interface VideoMediaFragmentInterface {
+        String patch_getEmbedHtml();
+        String patch_getUrl();
+    }
+
+    public interface CellGroupInterface {
+        Object patch_getCells();
+    }
+
+    public interface CellInterface {
+        Object patch_getMetadata();
+        Object patch_getLegacyVideo();
+    }
+
+    public interface CellMetadataInterface {
+        String patch_getMediaPath();
+        String patch_getMediaDomain();
+    }
+
+    public interface LegacyVideoInterface {
+        Object patch_getMedia();
+    }
+
+    public interface LegacyMediaInterface {
+        Object patch_getMediaSource();
+    }
+
+    public interface LegacyMediaSourceInterface {
+        String patch_getRedditPath();
+    }
+
+    /** RedditVideo already exposes these stable public getters; the patch only adds this interface. */
+    public interface RedditVideoInterface {
+        String getPackagedMp4Url();
+        String getDashUrl();
+        String getFallBackUrl();
+        String getHlsUrl();
+    }
+
+    private static final String AUTH_URL = "https://api.redgifs.com/v2/auth/temporary";
+    private static final String GIF_INFO_PREFIX = "https://api.redgifs.com/v2/gifs/";
+    private static final String ORIGIN = "https://www.redgifs.com";
+    private static final String REFERER = ORIGIN + "/";
+    private static final String MEDIA_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+
+    /** Prewarm is opportunistic; actual playback requests are never rejected by this cap. */
+    private static final int MAX_PENDING_PREWARMS = 32;
+    private static final int MAX_TRANSPORT_ROUTES = 256;
+    private static final int MAX_RETRY_EXPONENT = 6;
+    private static final long DIRECT_URL_FALLBACK_LIFETIME_NANOS = TimeUnit.SECONDS.toNanos(30);
+    private static final long DIRECT_URL_EXPIRY_MARGIN_MILLIS = TimeUnit.SECONDS.toMillis(5);
+    private static final long INITIAL_RETRY_DELAY_NANOS = TimeUnit.SECONDS.toNanos(1);
+    private static final long MAX_RETRY_DELAY_NANOS = TimeUnit.MINUTES.toNanos(1);
+    private static final long PLAYBACK_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(800);
+    private static final long PLAYBACK_RETRY_COOLDOWN_NANOS = TimeUnit.MILLISECONDS.toNanos(750);
+
+    private static final Pattern REDGIFS_SLUG = Pattern.compile(
+            "https?://(?:[A-Za-z0-9-]+\\.)*redgifs\\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern REDDIT_MEDIA_ID = Pattern.compile(
+            "https?://(?:v\\.redd\\.it|packaged-media\\.redd\\.it)/([A-Za-z0-9]+)",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern TOKEN_JSON = Pattern.compile(
+            "\\\"token\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+    );
+    private static final Pattern SD_URL_JSON = Pattern.compile(
+            "\\\"sd\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+    );
+    private static final Pattern HD_URL_JSON = Pattern.compile(
+            "\\\"hd\\\"\\s*:\\s*\\\"([^\\\"]+)\\\""
+    );
+    private static final Pattern GIF_DELETED_JSON = Pattern.compile(
+            "\\\"code\\\"\\s*:\\s*\\\"GifDeleted\\\""
+    );
+
+    private static final ThreadLocal<String> PENDING_REDGIFS_SLUG = new ThreadLocal<>();
+
+    private static final ConcurrentHashMap<String, String> MEDIA_TO_SLUG =
+            new ConcurrentHashMap<>();
+    private static final Set<String> CONFLICTED_MEDIA_IDS = ConcurrentHashMap.newKeySet();
+    private static final ConcurrentHashMap<String, ResolutionEntry> RESOLUTIONS_BY_SLUG =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Transport metadata outlives resolver validity because an already-created MediaSource can
+     * continue issuing DataSpecs after the resolver route expires or the active network changes.
+     */
+    private static final Map<String, ResolvedRoute> ROUTES_BY_URL = Collections.synchronizedMap(
+            new LinkedHashMap<String, ResolvedRoute>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ResolvedRoute> eldest) {
+                    return size() > MAX_TRANSPORT_ROUTES;
+                }
+            }
+    );
+
+    private static final AtomicLong RESOLUTION_SEQUENCE = new AtomicLong();
+    private static final ThreadPoolExecutor RESOLVER = new ThreadPoolExecutor(
+            2,
+            2,
+            0L,
+            TimeUnit.MILLISECONDS,
+            new PriorityBlockingQueue<>(),
+            new ThreadFactory() {
+                private int nextId = 1;
+
+                @Override
+                public synchronized Thread newThread(Runnable runnable) {
+                    Thread thread = new Thread(runnable, "morphe-redgifs-" + nextId++);
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            }
+    );
+
+    private static final Object TOKEN_LOCK = new Object();
+    private static volatile String temporaryToken;
+    private static volatile DataSpecAccess dataSpecAccess;
+
+    private RedgifsPlaybackPatch() {
+    }
+
+    public static void prewarmRedgifs(String embedHtml, String url) {
+        String slug = findRedgifsSlug(embedHtml, url);
+        if (slug != null) {
+            startResolution(entryForSlug(slug), false);
+        }
+    }
+
+    public static void prewarmCachedLinkJson(String linkJson) {
+        if (linkJson == null || linkJson.isEmpty()) return;
+        if (!REDGIFS_SLUG.matcher(linkJson).find()) return;
+        try {
+            JSONObject link = new JSONObject(linkJson);
+            String slug = findFirst(REDGIFS_SLUG, link.optString("url", null));
+            if (slug != null) {
+                startResolution(entryForSlug(slug), false);
+            }
+        } catch (JSONException | RuntimeException ignored) {
+        }
+    }
+
+    public static void captureMediaFragment(Object mediaFragment) {
+        String slug = extractConfirmedRedgifsSlug(mediaFragment);
+        if (slug == null) PENDING_REDGIFS_SLUG.remove();
+        else PENDING_REDGIFS_SLUG.set(slug);
+    }
+
+    public static void registerRedditVideo(Object redditVideo) {
+        String slug = PENDING_REDGIFS_SLUG.get();
+        PENDING_REDGIFS_SLUG.remove();
+        if (slug == null) return;
+
+        String mediaId = redditVideoMediaId(redditVideo);
+        if (mediaId != null) registerIdentity(mediaId, slug);
+    }
+
+    public static void registerCellGroup(Object cellGroupFragment) {
+        if (!(cellGroupFragment instanceof CellGroupInterface)) return;
+
+        Object cellsValue = ((CellGroupInterface) cellGroupFragment).patch_getCells();
+        if (!(cellsValue instanceof Iterable<?>)) return;
+
+        String slug = null;
+        String mediaId = null;
+
+        for (Object cell : (Iterable<?>) cellsValue) {
+            if (!(cell instanceof CellInterface)) continue;
+            CellInterface cellAdapter = (CellInterface) cell;
+
+            Object metadata = cellAdapter.patch_getMetadata();
+            if (metadata instanceof CellMetadataInterface) {
+                CellMetadataInterface metadataAdapter = (CellMetadataInterface) metadata;
+                String mediaPath = metadataAdapter.patch_getMediaPath();
+                String mediaDomain = metadataAdapter.patch_getMediaDomain();
+
+                if (mediaPath != null && mediaDomain != null &&
+                        "redgifs".equalsIgnoreCase(mediaDomain)) {
+                    String candidate = findFirst(REDGIFS_SLUG, mediaPath);
+                    if (candidate != null) {
+                        if (slug != null && !slug.equals(candidate)) return;
+                        slug = candidate;
+                    }
+                }
+            }
+
+            Object legacyVideo = cellAdapter.patch_getLegacyVideo();
+            if (!(legacyVideo instanceof LegacyVideoInterface)) continue;
+            Object media = ((LegacyVideoInterface) legacyVideo).patch_getMedia();
+            if (!(media instanceof LegacyMediaInterface)) continue;
+            Object mediaSource = ((LegacyMediaInterface) media).patch_getMediaSource();
+            if (!(mediaSource instanceof LegacyMediaSourceInterface)) continue;
+
+            String redditPath = ((LegacyMediaSourceInterface) mediaSource).patch_getRedditPath();
+            String candidate = findFirst(REDDIT_MEDIA_ID, redditPath);
+            if (candidate != null) {
+                if (mediaId != null && !mediaId.equals(candidate)) return;
+                mediaId = candidate;
+            }
+        }
+
+        if (slug != null && mediaId != null) registerIdentity(mediaId, slug);
+    }
+
+    /** Cache/domain feed path: Link.url supplies the slug; RedditVideo supplies the media id. */
+    public static void registerCachedRedgifs(String linkUrl, Object redditVideo) {
+        String slug = findRedgifsSlug(null, linkUrl);
+        String mediaId = redditVideoMediaId(redditVideo);
+        if (slug != null && mediaId != null) registerIdentity(mediaId, slug);
+    }
+
+    /**
+     * Identity is immutable once agreed. If two structural producers disagree for one media id,
+     * fail closed for that id instead of silently routing it to the last writer's RedGIFs slug.
+     */
+    private static void registerIdentity(String mediaId, String slug) {
+        if (mediaId == null || slug == null) return;
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) return;
+
+        String existing = MEDIA_TO_SLUG.putIfAbsent(mediaId, slug);
+        if (existing != null && !existing.equals(slug)) {
+            CONFLICTED_MEDIA_IDS.add(mediaId);
+            MEDIA_TO_SLUG.remove(mediaId);
+            return;
+        }
+
+        startResolution(entryForSlug(slug), false);
+    }
+
+    public static boolean overrideIsGif(boolean originalIsGif, Object redditVideo) {
+        if (!originalIsGif) return false;
+        String mediaId = redditVideoMediaId(redditVideo);
+        if (mediaId == null) return true;
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) return true;
+
+        String slug = MEDIA_TO_SLUG.get(mediaId);
+        if (slug == null) return true;
+
+        ResolutionEntry entry = RESOLUTIONS_BY_SLUG.get(slug);
+        if (entry == null) return true;
+        synchronized (entry) {
+            return entry.terminalFailure == TerminalFailure.GIF_DELETED;
+        }
+    }
+
+    public static String rewritePlaybackUrl(String currentUrl) {
+        if (currentUrl == null || currentUrl.isEmpty()) return currentUrl;
+
+        Uri currentUri;
+        try {
+            currentUri = Uri.parse(currentUrl);
+        } catch (RuntimeException ignored) {
+            return currentUrl;
+        }
+        if (isRedgifsMedia(currentUri)) return currentUrl;
+
+        String mediaId = findFirst(REDDIT_MEDIA_ID, currentUrl);
+        if (mediaId == null) return currentUrl;
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) return currentUrl;
+        String slug = MEDIA_TO_SLUG.get(mediaId);
+        if (slug == null) return currentUrl;
+
+        ResolutionEntry entry = entryForSlug(slug);
+        ResolvedRoute route = validRoute(entry, System.nanoTime());
+        if (route != null) return route.directUrl;
+
+        // A real playback request promotes a queued prewarm for this slug if possible.
+        startResolution(entry, true);
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            route = awaitRoute(entry);
+            if (route != null) return route.directUrl;
+        }
+        return currentUrl;
+    }
+
+    public static boolean forceCacheUriValidation(boolean original, Object uriObject) {
+        if (original) return true;
+        if (!(uriObject instanceof Uri)) return false;
+
+        Uri uri = (Uri) uriObject;
+        if (isRedgifsMedia(uri)) return true;
+
+        String mediaId = findFirst(REDDIT_MEDIA_ID, uri.toString());
+        return mediaId != null &&
+                !CONFLICTED_MEDIA_IDS.contains(mediaId) &&
+                MEDIA_TO_SLUG.containsKey(mediaId);
+    }
+
+    public static Object prepareDataSpec(Object dataSpec) {
+        if (dataSpec == null) return null;
+        try {
+            DataSpecAccess access = getDataSpecAccess(dataSpec);
+            Uri uri = (Uri) access.uriField.get(dataSpec);
+            if (!isRedgifsMedia(uri)) return dataSpec;
+
+            ResolvedRoute route = ROUTES_BY_URL.get(uri.toString());
+            Object builder = access.buildUpon.invoke(dataSpec);
+            if (route != null && route.cacheKey != null) {
+                access.builderKeyField.set(builder, route.cacheKey);
+            }
+
+            @SuppressWarnings("unchecked")
+            Map<String, String> existingHeaders =
+                    (Map<String, String>) access.builderRequestHeadersField.get(builder);
+            access.builderRequestHeadersField.set(
+                    builder,
+                    redgifsRequestHeaders(existingHeaders, route == null ? null : route.slug)
+            );
+            return access.build.invoke(builder);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            return dataSpec;
+        }
+    }
+
+    private static String findRedgifsSlug(String embedHtml, String url) {
+        String slug = findFirst(REDGIFS_SLUG, url);
+        return slug != null ? slug : findFirst(REDGIFS_SLUG, embedHtml);
+    }
+
+    private static String extractConfirmedRedgifsSlug(Object mediaFragment) {
+        if (!(mediaFragment instanceof MediaFragmentInterface)) return null;
+        Object redditVideoMedia =
+                ((MediaFragmentInterface) mediaFragment).patch_getRedditVideoMedia();
+        if (!(redditVideoMedia instanceof RedditVideoMediaInterface)) return null;
+        Object videoMedia =
+                ((RedditVideoMediaInterface) redditVideoMedia).patch_getVideoMedia();
+        if (!(videoMedia instanceof VideoMediaFragmentInterface)) return null;
+
+        VideoMediaFragmentInterface videoMediaAdapter =
+                (VideoMediaFragmentInterface) videoMedia;
+        return findRedgifsSlug(
+                videoMediaAdapter.patch_getEmbedHtml(),
+                videoMediaAdapter.patch_getUrl()
+        );
+    }
+
+    /**
+     * Uses every statically present RedditVideo URL getter and accepts only one unique media id.
+     * If two URL fields disagree, fail closed instead of choosing an arbitrary source identity.
+     */
+    private static String redditVideoMediaId(Object redditVideo) {
+        if (!(redditVideo instanceof RedditVideoInterface)) return null;
+        RedditVideoInterface video = (RedditVideoInterface) redditVideo;
+        String[] urls = {
+                video.getPackagedMp4Url(),
+                video.getDashUrl(),
+                video.getFallBackUrl(),
+                video.getHlsUrl(),
+        };
+
+        String resolvedMediaId = null;
+        for (String value : urls) {
+            String mediaId = findFirst(REDDIT_MEDIA_ID, value);
+            if (mediaId == null) continue;
+            if (resolvedMediaId == null) {
+                resolvedMediaId = mediaId;
+            } else if (!resolvedMediaId.equals(mediaId)) {
+                return null;
+            }
+        }
+        return resolvedMediaId;
+    }
+
+    private static ResolutionEntry entryForSlug(String slug) {
+        return RESOLUTIONS_BY_SLUG.computeIfAbsent(slug, ResolutionEntry::new);
+    }
+
+    private static ResolvedRoute validRoute(ResolutionEntry entry, long nowNanos) {
+        ResolvedRoute route = entry.route;
+        if (route == null) return null;
+
+        String networkIdentity = currentNetworkIdentity();
+        boolean sameNetwork = route.networkIdentity == null || networkIdentity == null ||
+                route.networkIdentity.equals(networkIdentity);
+        if (sameNetwork && nowNanos < route.expiresAtNanos) return route;
+
+        // Only resolver ownership expires here. Transport metadata must remain available to
+        // MediaSources that were already created with this exact direct URL.
+        synchronized (entry) {
+            if (entry.route == route) entry.route = null;
+        }
+        return null;
+    }
+
+    private static ResolvedRoute awaitRoute(ResolutionEntry entry) {
+        long deadline = System.nanoTime() + PLAYBACK_WAIT_NANOS;
+        synchronized (entry) {
+            while (true) {
+                ResolvedRoute route = validRoute(entry, System.nanoTime());
+                if (route != null) return route;
+                if (entry.terminalFailure == TerminalFailure.GIF_DELETED || !entry.resolving) {
+                    return null;
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) return null;
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(entry, remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+    }
+
+    private static void startResolution(ResolutionEntry entry, boolean playbackPriority) {
+        ResolutionTask taskToSchedule = null;
+
+        synchronized (entry) {
+            long nowNanos = System.nanoTime();
+            if (entry.terminalFailure == TerminalFailure.GIF_DELETED) return;
+            if (validRoute(entry, nowNanos) != null) return;
+
+            if (entry.resolving) {
+                ResolutionTask pending = entry.pendingTask;
+                if (playbackPriority && pending != null && !pending.playbackPriority &&
+                        RESOLVER.remove(pending)) {
+                    taskToSchedule = new ResolutionTask(entry, true);
+                    entry.pendingTask = taskToSchedule;
+                } else {
+                    return;
+                }
+            } else {
+                if (playbackPriority) {
+                    if (nowNanos < entry.nextPlaybackRetryAtNanos) return;
+                } else {
+                    if (nowNanos < entry.nextRetryAtNanos) return;
+                    if (RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) return;
+                }
+
+                taskToSchedule = new ResolutionTask(entry, playbackPriority);
+                entry.pendingTask = taskToSchedule;
+                entry.resolving = true;
+            }
+        }
+
+        try {
+            RESOLVER.execute(taskToSchedule);
+        } catch (RuntimeException exception) {
+            synchronized (entry) {
+                if (entry.pendingTask == taskToSchedule) {
+                    entry.pendingTask = null;
+                    entry.resolving = false;
+                    if (taskToSchedule.playbackPriority) {
+                        entry.nextPlaybackRetryAtNanos =
+                                System.nanoTime() + PLAYBACK_RETRY_COOLDOWN_NANOS;
+                    }
+                    entry.notifyAll();
+                }
+            }
+        }
+    }
+
+    private static void completeResolution(ResolutionEntry entry, ResolutionResult result,
+                                           boolean playbackPriority) {
+        ResolvedRoute published = null;
+        if (result.directUrl != null) {
+            published = new ResolvedRoute(
+                    entry.slug,
+                    result.directUrl,
+                    result.cacheKey,
+                    directUrlExpiryDeadlineNanos(
+                            result.directUrl,
+                            System.nanoTime(),
+                            System.currentTimeMillis()
+                    ),
+                    currentNetworkIdentity()
+            );
+            ROUTES_BY_URL.put(published.directUrl, published);
+        }
+
+        synchronized (entry) {
+            entry.pendingTask = null;
+            entry.resolving = false;
+            if (published != null) {
+                entry.route = published;
+                entry.failureCount = 0;
+                entry.nextRetryAtNanos = 0;
+                entry.nextPlaybackRetryAtNanos = 0;
+                entry.terminalFailure = TerminalFailure.NONE;
+            } else if (result.terminalFailure == TerminalFailure.GIF_DELETED) {
+                entry.route = null;
+                entry.failureCount = 0;
+                entry.nextRetryAtNanos = 0;
+                entry.nextPlaybackRetryAtNanos = 0;
+                entry.terminalFailure = TerminalFailure.GIF_DELETED;
+            } else {
+                long nowNanos = System.nanoTime();
+                entry.failureCount = Math.min(entry.failureCount + 1, MAX_RETRY_EXPONENT + 1);
+                long delay = INITIAL_RETRY_DELAY_NANOS << (entry.failureCount - 1);
+                entry.nextRetryAtNanos = nowNanos + Math.min(delay, MAX_RETRY_DELAY_NANOS);
+                if (playbackPriority) {
+                    entry.nextPlaybackRetryAtNanos = nowNanos + PLAYBACK_RETRY_COOLDOWN_NANOS;
+                }
+            }
+            entry.notifyAll();
+        }
+    }
+
+    private static ResolutionResult resolveDirectMediaUrl(String slug) {
+        try {
+            String token = getTemporaryToken();
+            if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
+
+            Response response = requestGifInfo(slug, token);
+            if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                clearTemporaryToken(token);
+                token = getTemporaryToken();
+                if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
+                response = requestGifInfo(slug, token);
+            }
+
+            if (response.code == HttpURLConnection.HTTP_GONE &&
+                    GIF_DELETED_JSON.matcher(response.body).find()) {
+                return ResolutionResult.GIF_DELETED;
+            }
+            if (response.code < 200 || response.code >= 300) {
+                return ResolutionResult.TRANSIENT_FAILURE;
+            }
+
+            DirectMedia directMedia = extractDirectMedia(response.body);
+            if (directMedia == null) return ResolutionResult.TRANSIENT_FAILURE;
+            ProbeResult probe = probeDirectMediaUrl(directMedia.url, slug);
+            if (probe.code >= 200 && probe.code < 300) {
+                return ResolutionResult.success(
+                        directMedia.url,
+                        cacheKeyForDirectMedia(
+                                directMedia.variant,
+                                directMedia.url,
+                                probe.finalUrl,
+                                probe.etag
+                        )
+                );
+            }
+
+            if (probe.code == HttpURLConnection.HTTP_UNAUTHORIZED ||
+                    probe.code == HttpURLConnection.HTTP_FORBIDDEN) {
+                clearTemporaryToken(token);
+                token = getTemporaryToken();
+                if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
+                response = requestGifInfo(slug, token);
+                if (response.code < 200 || response.code >= 300) {
+                    return ResolutionResult.TRANSIENT_FAILURE;
+                }
+                directMedia = extractDirectMedia(response.body);
+                if (directMedia == null) return ResolutionResult.TRANSIENT_FAILURE;
+                probe = probeDirectMediaUrl(directMedia.url, slug);
+                if (probe.code >= 200 && probe.code < 300) {
+                    return ResolutionResult.success(
+                            directMedia.url,
+                            cacheKeyForDirectMedia(
+                                    directMedia.variant,
+                                    directMedia.url,
+                                    probe.finalUrl,
+                                    probe.etag
+                            )
+                    );
+                }
+            }
+            return ResolutionResult.TRANSIENT_FAILURE;
+        } catch (IOException ignored) {
+            return ResolutionResult.TRANSIENT_FAILURE;
+        }
+    }
+
+    private static String getTemporaryToken() throws IOException {
+        String token = temporaryToken;
+        if (token != null && !token.isEmpty()) return token;
+        synchronized (TOKEN_LOCK) {
+            token = temporaryToken;
+            if (token != null && !token.isEmpty()) return token;
+
+            Response response = request(AUTH_URL, null, null);
+            if (response.code < 200 || response.code >= 300) return null;
+            token = findFirst(TOKEN_JSON, response.body);
+            if (token == null) return null;
+            temporaryToken = unescapeJsonString(token);
+            return temporaryToken;
+        }
+    }
+
+    private static void clearTemporaryToken(String rejectedToken) {
+        synchronized (TOKEN_LOCK) {
+            if (rejectedToken != null && rejectedToken.equals(temporaryToken)) {
+                temporaryToken = null;
+            }
+        }
+    }
+
+    private static Response requestGifInfo(String slug, String token) throws IOException {
+        return request(
+                GIF_INFO_PREFIX + slug + "?views=yes",
+                "Bearer " + token,
+                ORIGIN + "/watch/" + slug
+        );
+    }
+
+    private static Response request(String url, String authorization, String customHeader)
+            throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(4_000);
+            connection.setReadTimeout(6_000);
+            connection.setUseCaches(false);
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("Origin", ORIGIN);
+            connection.setRequestProperty("Referer", REFERER);
+            connection.setRequestProperty("User-Agent", MEDIA_USER_AGENT);
+            if (authorization != null) connection.setRequestProperty("Authorization", authorization);
+            if (customHeader != null) connection.setRequestProperty("x-customheader", customHeader);
+
+            int code = connection.getResponseCode();
+            InputStream input = code >= 400 ? connection.getErrorStream() : connection.getInputStream();
+            return new Response(code, input == null ? "" : readFully(input));
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static ProbeResult probeDirectMediaUrl(String directUrl, String slug)
+            throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(directUrl).openConnection();
+        try {
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(4_000);
+            connection.setReadTimeout(6_000);
+            connection.setUseCaches(false);
+            connection.setInstanceFollowRedirects(true);
+            connection.setRequestProperty("Range", "bytes=0-0");
+            for (Map.Entry<String, String> header : redgifsRequestHeaders(null, slug).entrySet()) {
+                connection.setRequestProperty(header.getKey(), header.getValue());
+            }
+            int code = connection.getResponseCode();
+            return new ProbeResult(
+                    code,
+                    connection.getURL().toString(),
+                    connection.getHeaderField("ETag")
+            );
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static String currentNetworkIdentity() {
+        try {
+            if (!Utils.isContextSet()) return null;
+            Context context = Utils.getContext();
+            ConnectivityManager connectivityManager =
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (connectivityManager == null) return null;
+            Network network = connectivityManager.getActiveNetwork();
+            return network == null ? null : network.toString();
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static DataSpecAccess getDataSpecAccess(Object dataSpec)
+            throws ReflectiveOperationException {
+        DataSpecAccess access = dataSpecAccess;
+        if (access != null && access.dataSpecClass == dataSpec.getClass()) return access;
+        synchronized (RedgifsPlaybackPatch.class) {
+            access = dataSpecAccess;
+            if (access == null || access.dataSpecClass != dataSpec.getClass()) {
+                access = new DataSpecAccess(dataSpec.getClass());
+                dataSpecAccess = access;
+            }
+            return access;
+        }
+    }
+
+    static Map<String, String> redgifsRequestHeaders(Map<String, String> existing, String slug) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (existing != null) headers.putAll(existing);
+        putHeader(headers, "Origin", ORIGIN);
+        putHeader(headers, "Referer", REFERER);
+        putHeader(headers, "User-Agent", MEDIA_USER_AGENT);
+        if (slug != null && !slug.isEmpty()) {
+            putHeader(headers, "x-customheader", ORIGIN + "/watch/" + slug);
+        }
+        return Collections.unmodifiableMap(headers);
+    }
+
+    private static void putHeader(Map<String, String> headers, String name, String value) {
+        String existingName = null;
+        for (String candidate : headers.keySet()) {
+            if (name.equalsIgnoreCase(candidate)) {
+                existingName = candidate;
+                break;
+            }
+        }
+        if (existingName != null) headers.remove(existingName);
+        headers.put(name, value);
+    }
+
+    private static boolean isRedgifsMedia(Uri uri) {
+        if (uri == null || !"https".equalsIgnoreCase(uri.getScheme())) return false;
+        String host = uri.getHost();
+        if (host == null) return false;
+        String normalizedHost = host.toLowerCase(Locale.US);
+        boolean redgifsHost = "redgifs.com".equals(normalizedHost) ||
+                normalizedHost.endsWith(".redgifs.com");
+        if (!redgifsHost || "api.redgifs.com".equals(normalizedHost) ||
+                "www.redgifs.com".equals(normalizedHost)) {
+            return false;
+        }
+        String path = uri.getPath();
+        return path != null && path.toLowerCase(Locale.US).endsWith(".mp4");
+    }
+
+    private static Field accessibleField(Class<?> owner, String name)
+            throws NoSuchFieldException {
+        Field field = owner.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+    }
+
+    private static Method accessibleMethod(Class<?> owner, String name)
+            throws NoSuchMethodException {
+        Method method = owner.getDeclaredMethod(name);
+        method.setAccessible(true);
+        return method;
+    }
+
+    private static String readFully(InputStream input) throws IOException {
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            StringBuilder result = new StringBuilder();
+            char[] buffer = new char[4096];
+            int count;
+            while ((count = reader.read(buffer)) != -1) result.append(buffer, 0, count);
+            return result.toString();
+        }
+    }
+
+    static String extractDirectMediaUrl(String json) {
+        DirectMedia directMedia = extractDirectMedia(json);
+        return directMedia == null ? null : directMedia.url;
+    }
+
+    private static DirectMedia extractDirectMedia(String json) {
+        String directUrl = findFirst(SD_URL_JSON, json);
+        if (directUrl != null) return new DirectMedia(unescapeJsonString(directUrl), "sd");
+        directUrl = findFirst(HD_URL_JSON, json);
+        return directUrl == null ? null : new DirectMedia(unescapeJsonString(directUrl), "hd");
+    }
+
+    static String cacheKeyForDirectMedia(String variant, String directUrl, String finalUrl,
+                                         String etag) {
+        String normalizedVariant = "hd".equalsIgnoreCase(variant) ? "hd" : "sd";
+        String normalizedPath = normalizedOriginAndPath(finalUrl);
+        if (normalizedPath == null) normalizedPath = normalizedOriginAndPath(directUrl);
+
+        String strongEtag = strongEtag(etag);
+        if (strongEtag != null) {
+            String resource = normalizedPath == null ? String.valueOf(directUrl) : normalizedPath;
+            return "redgifs:v1:" + normalizedVariant + ":etag:" +
+                    sha256(resource + '\n' + strongEtag);
+        }
+        if (normalizedPath != null) {
+            return "redgifs:v1:" + normalizedVariant + ":path:" + sha256(normalizedPath);
+        }
+        return "redgifs:v1:" + normalizedVariant + ":url:" + sha256(directUrl);
+    }
+
+    private static String strongEtag(String etag) {
+        if (etag == null) return null;
+        String trimmed = etag.trim();
+        if (trimmed.isEmpty() || trimmed.regionMatches(true, 0, "W/", 0, 2)) return null;
+        return trimmed;
+    }
+
+    private static String normalizedOriginAndPath(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            URL url = new URL(value);
+            String protocol = url.getProtocol();
+            String host = url.getHost();
+            if (protocol.isEmpty() || host.isEmpty()) return null;
+            int port = url.getPort();
+            String path = url.getPath();
+            if (path == null || path.isEmpty()) path = "/";
+            return protocol.toLowerCase(Locale.US) + "://" + host.toLowerCase(Locale.US) +
+                    (port >= 0 && port != url.getDefaultPort() ? ":" + port : "") + path;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(
+                    String.valueOf(value).getBytes(StandardCharsets.UTF_8)
+            );
+            char[] hex = new char[digest.length * 2];
+            final char[] digits = "0123456789abcdef".toCharArray();
+            for (int i = 0; i < digest.length; i++) {
+                int unsigned = digest[i] & 0xff;
+                hex[i * 2] = digits[unsigned >>> 4];
+                hex[i * 2 + 1] = digits[unsigned & 0x0f];
+            }
+            return new String(hex);
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new AssertionError(impossible);
+        }
+    }
+
+    static long directUrlExpiryDeadlineNanos(String directUrl, long nowNanos,
+                                             long nowEpochMillis) {
+        long fallbackDeadline = nowNanos + DIRECT_URL_FALLBACK_LIFETIME_NANOS;
+        if (directUrl == null) return fallbackDeadline;
+        try {
+            String query = new URL(directUrl).getQuery();
+            if (query == null || query.isEmpty()) return fallbackDeadline;
+            for (String parameter : query.split("&")) {
+                int separator = parameter.indexOf('=');
+                if (separator <= 0) continue;
+                String name = URLDecoder.decode(
+                        parameter.substring(0, separator), StandardCharsets.UTF_8.name());
+                if (!"expires".equalsIgnoreCase(name) && !"exp".equalsIgnoreCase(name)) continue;
+                String rawValue = URLDecoder.decode(
+                        parameter.substring(separator + 1), StandardCharsets.UTF_8.name());
+                long epochValue = Long.parseLong(rawValue);
+                long expiryMillis = epochValue < 100_000_000_000L
+                        ? TimeUnit.SECONDS.toMillis(epochValue)
+                        : epochValue;
+                long remainingMillis = expiryMillis - nowEpochMillis -
+                        DIRECT_URL_EXPIRY_MARGIN_MILLIS;
+                if (remainingMillis <= 0) return nowNanos;
+                return nowNanos + TimeUnit.MILLISECONDS.toNanos(remainingMillis);
+            }
+        } catch (IOException | NumberFormatException ignored) {
+        }
+        return fallbackDeadline;
+    }
+
+    private static String findFirst(Pattern pattern, String value) {
+        if (value == null || value.isEmpty()) return null;
+        Matcher matcher = pattern.matcher(value);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static String unescapeJsonString(String value) {
+        if (value == null || value.indexOf('\\') < 0) return value;
+        StringBuilder out = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            if (character != '\\' || i + 1 >= value.length()) {
+                out.append(character);
+                continue;
+            }
+            char escaped = value.charAt(++i);
+            switch (escaped) {
+                case '"': out.append('"'); break;
+                case '\\': out.append('\\'); break;
+                case '/': out.append('/'); break;
+                case 'b': out.append('\b'); break;
+                case 'f': out.append('\f'); break;
+                case 'n': out.append('\n'); break;
+                case 'r': out.append('\r'); break;
+                case 't': out.append('\t'); break;
+                case 'u':
+                    if (i + 4 < value.length()) {
+                        try {
+                            out.append((char) Integer.parseInt(value.substring(i + 1, i + 5), 16));
+                            i += 4;
+                            break;
+                        } catch (NumberFormatException ignored) {
+                            out.append("\\u");
+                            break;
+                        }
+                    }
+                    out.append("\\u");
+                    break;
+                default: out.append(escaped); break;
+            }
+        }
+        return out.toString();
+    }
+
+    private enum TerminalFailure {
+        NONE,
+        GIF_DELETED
+    }
+
+    private static final class ResolutionEntry {
+        final String slug;
+        volatile ResolvedRoute route;
+        boolean resolving;
+        ResolutionTask pendingTask;
+        int failureCount;
+        long nextRetryAtNanos;
+        long nextPlaybackRetryAtNanos;
+        TerminalFailure terminalFailure = TerminalFailure.NONE;
+
+        ResolutionEntry(String slug) {
+            this.slug = slug;
+        }
+    }
+
+    private static final class ResolutionTask implements Runnable, Comparable<ResolutionTask> {
+        final ResolutionEntry entry;
+        final boolean playbackPriority;
+        final long sequence = RESOLUTION_SEQUENCE.getAndIncrement();
+
+        ResolutionTask(ResolutionEntry entry, boolean playbackPriority) {
+            this.entry = entry;
+            this.playbackPriority = playbackPriority;
+        }
+
+        @Override
+        public int compareTo(ResolutionTask other) {
+            if (playbackPriority != other.playbackPriority) {
+                return playbackPriority ? -1 : 1;
+            }
+            return Long.compare(sequence, other.sequence);
+        }
+
+        @Override
+        public void run() {
+            synchronized (entry) {
+                if (entry.pendingTask != this) return;
+                entry.pendingTask = null;
+            }
+
+            ResolutionResult result = ResolutionResult.TRANSIENT_FAILURE;
+            try {
+                result = resolveDirectMediaUrl(entry.slug);
+            } catch (RuntimeException ignored) {
+            }
+            completeResolution(entry, result, playbackPriority);
+        }
+    }
+
+    private static final class ResolvedRoute {
+        final String slug;
+        final String directUrl;
+        final String cacheKey;
+        final long expiresAtNanos;
+        final String networkIdentity;
+
+        ResolvedRoute(String slug, String directUrl, String cacheKey, long expiresAtNanos,
+                      String networkIdentity) {
+            this.slug = slug;
+            this.directUrl = directUrl;
+            this.cacheKey = cacheKey;
+            this.expiresAtNanos = expiresAtNanos;
+            this.networkIdentity = networkIdentity;
+        }
+    }
+
+    private static final class DirectMedia {
+        final String url;
+        final String variant;
+
+        DirectMedia(String url, String variant) {
+            this.url = url;
+            this.variant = variant;
+        }
+    }
+
+    private static final class ProbeResult {
+        final int code;
+        final String finalUrl;
+        final String etag;
+
+        ProbeResult(int code, String finalUrl, String etag) {
+            this.code = code;
+            this.finalUrl = finalUrl;
+            this.etag = etag;
+        }
+    }
+
+    private static final class ResolutionResult {
+        static final ResolutionResult TRANSIENT_FAILURE =
+                new ResolutionResult(null, null, TerminalFailure.NONE);
+        static final ResolutionResult GIF_DELETED =
+                new ResolutionResult(null, null, TerminalFailure.GIF_DELETED);
+
+        final String directUrl;
+        final String cacheKey;
+        final TerminalFailure terminalFailure;
+
+        private ResolutionResult(String directUrl, String cacheKey, TerminalFailure terminalFailure) {
+            this.directUrl = directUrl;
+            this.cacheKey = cacheKey;
+            this.terminalFailure = terminalFailure;
+        }
+
+        static ResolutionResult success(String directUrl, String cacheKey) {
+            return new ResolutionResult(directUrl, cacheKey, TerminalFailure.NONE);
+        }
+    }
+
+    private static final class DataSpecAccess {
+        final Class<?> dataSpecClass;
+        final Field uriField;
+        final Method buildUpon;
+        final Field builderRequestHeadersField;
+        final Field builderKeyField;
+        final Method build;
+
+        DataSpecAccess(Class<?> dataSpecClass) throws ReflectiveOperationException {
+            this.dataSpecClass = dataSpecClass;
+            uriField = accessibleField(dataSpecClass, "a");
+            buildUpon = accessibleMethod(dataSpecClass, "a");
+            Class<?> builderClass = buildUpon.getReturnType();
+            builderRequestHeadersField = accessibleField(builderClass, "e");
+            if (!Map.class.isAssignableFrom(builderRequestHeadersField.getType())) {
+                throw new NoSuchFieldException("DataSpec.Builder request headers field");
+            }
+            builderKeyField = accessibleField(builderClass, "h");
+            build = accessibleMethod(builderClass, "a");
+        }
+    }
+
+    private static final class Response {
+        final int code;
+        final String body;
+
+        Response(int code, String body) {
+            this.code = code;
+            this.body = body;
+        }
+    }
+}
