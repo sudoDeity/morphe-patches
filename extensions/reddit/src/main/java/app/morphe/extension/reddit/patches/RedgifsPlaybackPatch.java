@@ -12,6 +12,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.Uri;
 import android.os.Looper;
+import android.util.Log;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -50,6 +51,7 @@ import app.morphe.extension.shared.Utils;
  */
 @SuppressWarnings("unused")
 public final class RedgifsPlaybackPatch {
+    private static final String TAG = "MorpheRedgifs";
     private static final String AUTH_URL = "https://api.redgifs.com/v2/auth/temporary";
     private static final String GIF_INFO_PREFIX = "https://api.redgifs.com/v2/gifs/";
     private static final String ORIGIN = "https://www.redgifs.com";
@@ -144,9 +146,16 @@ public final class RedgifsPlaybackPatch {
     private RedgifsPlaybackPatch() {
     }
 
+    private static void debug(String message) {
+        Log.d(TAG, message);
+    }
+
     public static void prewarmRedgifs(String embedHtml, String url) {
         String slug = findRedgifsSlug(embedHtml, url);
-        if (slug != null) startResolution(entryForSlug(slug), false);
+        if (slug != null) {
+            debug("PREWARM slug=" + slug);
+            startResolution(entryForSlug(slug), false);
+        }
     }
 
     public static void prewarmCachedLinkJson(String linkJson) {
@@ -155,13 +164,18 @@ public final class RedgifsPlaybackPatch {
         try {
             JSONObject link = new JSONObject(linkJson);
             String slug = findFirst(REDGIFS_SLUG, link.optString("url", null));
-            if (slug != null) startResolution(entryForSlug(slug), false);
-        } catch (JSONException | RuntimeException ignored) {
+            if (slug != null) {
+                debug("CACHE_JSON slug=" + slug);
+                startResolution(entryForSlug(slug), false);
+            }
+        } catch (JSONException | RuntimeException exception) {
+            debug("CACHE_JSON error=" + exception.getClass().getSimpleName());
         }
     }
 
     public static void captureMediaFragment(Object mediaFragment) {
         String slug = extractConfirmedRedgifsSlug(mediaFragment);
+        debug("FRAGMENT slug=" + slug);
         if (slug == null) PENDING_REDGIFS_SLUG.remove();
         else PENDING_REDGIFS_SLUG.set(slug);
     }
@@ -172,6 +186,7 @@ public final class RedgifsPlaybackPatch {
         if (slug == null) return;
 
         String mediaId = redditVideoMediaId(redditVideo);
+        debug("VIDEO slug=" + slug + " mediaId=" + mediaId);
         if (mediaId != null) registerIdentity(mediaId, slug);
     }
 
@@ -208,7 +223,10 @@ public final class RedgifsPlaybackPatch {
                             "redgifs".equalsIgnoreCase((String) mediaDomainValue)) {
                         String candidate = findFirst(REDGIFS_SLUG, (String) mediaPathValue);
                         if (candidate != null) {
-                            if (slug != null && !slug.equals(candidate)) return;
+                            if (slug != null && !slug.equals(candidate)) {
+                                debug("CELL conflicting-slug first=" + slug + " second=" + candidate);
+                                return;
+                            }
                             slug = candidate;
                         }
                     }
@@ -230,13 +248,18 @@ public final class RedgifsPlaybackPatch {
                         ? findFirst(REDDIT_MEDIA_ID, (String) redditPathValue)
                         : null;
                 if (candidate != null) {
-                    if (mediaId != null && !mediaId.equals(candidate)) return;
+                    if (mediaId != null && !mediaId.equals(candidate)) {
+                        debug("CELL conflicting-media first=" + mediaId + " second=" + candidate);
+                        return;
+                    }
                     mediaId = candidate;
                 }
             }
 
+            debug("CELL slug=" + slug + " mediaId=" + mediaId);
             if (slug != null && mediaId != null) registerIdentity(mediaId, slug);
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            debug("CELL error=" + exception.getClass().getSimpleName());
         }
     }
 
@@ -244,6 +267,7 @@ public final class RedgifsPlaybackPatch {
     public static void registerCachedRedgifs(String linkUrl, Object redditVideo) {
         String slug = findRedgifsSlug(null, linkUrl);
         String mediaId = redditVideoMediaId(redditVideo);
+        debug("CACHE_LINK slug=" + slug + " mediaId=" + mediaId);
         if (slug != null && mediaId != null) registerIdentity(mediaId, slug);
     }
 
@@ -252,30 +276,53 @@ public final class RedgifsPlaybackPatch {
      * fail closed for that id instead of silently routing it to the last writer's RedGIFs slug.
      */
     private static void registerIdentity(String mediaId, String slug) {
-        if (mediaId == null || slug == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return;
+        if (mediaId == null || slug == null) return;
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) {
+            debug("IDENTITY blocked mediaId=" + mediaId + " slug=" + slug);
+            return;
+        }
 
         String existing = MEDIA_TO_SLUG.putIfAbsent(mediaId, slug);
         if (existing != null && !existing.equals(slug)) {
+            debug("IDENTITY conflict mediaId=" + mediaId + " existing=" + existing + " new=" + slug);
             CONFLICTED_MEDIA_IDS.add(mediaId);
             MEDIA_TO_SLUG.remove(mediaId);
             return;
         }
 
+        debug("IDENTITY " + (existing == null ? "new" : "repeat") +
+                " mediaId=" + mediaId + " slug=" + slug);
         startResolution(entryForSlug(slug), false);
     }
 
     public static boolean overrideIsGif(boolean originalIsGif, Object redditVideo) {
         if (!originalIsGif) return false;
         String mediaId = redditVideoMediaId(redditVideo);
-        if (mediaId == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return true;
+        if (mediaId == null) {
+            debug("ISGIF original=true mediaId=null result=true");
+            return true;
+        }
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) {
+            debug("ISGIF mediaId=" + mediaId + " conflict result=true");
+            return true;
+        }
 
         String slug = MEDIA_TO_SLUG.get(mediaId);
-        if (slug == null) return true;
+        if (slug == null) {
+            debug("ISGIF mediaId=" + mediaId + " slug=null result=true");
+            return true;
+        }
 
         ResolutionEntry entry = RESOLUTIONS_BY_SLUG.get(slug);
-        if (entry == null) return true;
+        if (entry == null) {
+            debug("ISGIF mediaId=" + mediaId + " slug=" + slug + " entry=null result=true");
+            return true;
+        }
         synchronized (entry) {
-            return entry.terminalFailure == TerminalFailure.GIF_DELETED;
+            boolean result = entry.terminalFailure == TerminalFailure.GIF_DELETED;
+            debug("ISGIF mediaId=" + mediaId + " slug=" + slug + " result=" + result +
+                    " resolving=" + entry.resolving + " route=" + (entry.route != null));
+            return result;
         }
     }
 
@@ -285,26 +332,51 @@ public final class RedgifsPlaybackPatch {
         Uri currentUri;
         try {
             currentUri = Uri.parse(currentUrl);
-        } catch (RuntimeException ignored) {
+        } catch (RuntimeException exception) {
+            debug("REWRITE invalid-url in=" + currentUrl);
             return currentUrl;
         }
-        if (isRedgifsMedia(currentUri)) return currentUrl;
+        if (isRedgifsMedia(currentUri)) {
+            debug("REWRITE already-direct out=" + currentUrl);
+            return currentUrl;
+        }
 
         String mediaId = findFirst(REDDIT_MEDIA_ID, currentUrl);
-        if (mediaId == null || CONFLICTED_MEDIA_IDS.contains(mediaId)) return currentUrl;
+        if (mediaId == null) {
+            debug("REWRITE no-media-id in=" + currentUrl);
+            return currentUrl;
+        }
+        if (CONFLICTED_MEDIA_IDS.contains(mediaId)) {
+            debug("REWRITE conflict mediaId=" + mediaId + " in=" + currentUrl);
+            return currentUrl;
+        }
         String slug = MEDIA_TO_SLUG.get(mediaId);
-        if (slug == null) return currentUrl;
+        if (slug == null) {
+            debug("REWRITE no-identity mediaId=" + mediaId + " in=" + currentUrl);
+            return currentUrl;
+        }
 
         ResolutionEntry entry = entryForSlug(slug);
         ResolvedRoute route = validRoute(entry, System.nanoTime());
-        if (route != null) return route.directUrl;
+        if (route != null) {
+            debug("REWRITE hit mediaId=" + mediaId + " slug=" + slug +
+                    " in=" + currentUrl + " out=" + route.directUrl);
+            return route.directUrl;
+        }
 
+        debug("REWRITE miss mediaId=" + mediaId + " slug=" + slug +
+                " main=" + (Looper.myLooper() == Looper.getMainLooper()) + " in=" + currentUrl);
         // A real playback request promotes a queued prewarm for this slug if possible.
         startResolution(entry, true);
         if (Looper.myLooper() != Looper.getMainLooper()) {
             route = awaitRoute(entry);
-            if (route != null) return route.directUrl;
+            if (route != null) {
+                debug("REWRITE waited-hit mediaId=" + mediaId + " slug=" + slug +
+                        " out=" + route.directUrl);
+                return route.directUrl;
+            }
         }
+        debug("REWRITE fallback mediaId=" + mediaId + " slug=" + slug + " out=" + currentUrl);
         return currentUrl;
     }
 
@@ -313,12 +385,19 @@ public final class RedgifsPlaybackPatch {
         if (!(uriObject instanceof Uri)) return false;
 
         Uri uri = (Uri) uriObject;
-        if (isRedgifsMedia(uri)) return true;
+        if (isRedgifsMedia(uri)) {
+            debug("CACHE_VALIDATE direct uri=" + uri);
+            return true;
+        }
 
         String mediaId = findFirst(REDDIT_MEDIA_ID, uri.toString());
-        return mediaId != null &&
+        boolean result = mediaId != null &&
                 !CONFLICTED_MEDIA_IDS.contains(mediaId) &&
                 MEDIA_TO_SLUG.containsKey(mediaId);
+        if (mediaId != null) {
+            debug("CACHE_VALIDATE mediaId=" + mediaId + " result=" + result + " uri=" + uri);
+        }
+        return result;
     }
 
     public static Object prepareDataSpec(Object dataSpec) {
@@ -329,6 +408,8 @@ public final class RedgifsPlaybackPatch {
             if (!isRedgifsMedia(uri)) return dataSpec;
 
             ResolvedRoute route = ROUTES_BY_URL.get(uri.toString());
+            debug("DATASPEC uri=" + uri + " route=" + (route == null ? "miss" : "hit") +
+                    " slug=" + (route == null ? null : route.slug));
             Object builder = access.buildUpon.invoke(dataSpec);
             if (route != null && route.cacheKey != null) {
                 access.builderKeyField.set(builder, route.cacheKey);
@@ -341,8 +422,12 @@ public final class RedgifsPlaybackPatch {
                     builder,
                     redgifsRequestHeaders(existingHeaders, route == null ? null : route.slug)
             );
-            return access.build.invoke(builder);
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            Object result = access.build.invoke(builder);
+            debug("DATASPEC prepared uri=" + uri + " cacheKey=" +
+                    (route == null ? null : route.cacheKey));
+            return result;
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            debug("DATASPEC error=" + exception.getClass().getSimpleName());
             return dataSpec;
         }
     }
@@ -454,8 +539,12 @@ public final class RedgifsPlaybackPatch {
 
         synchronized (entry) {
             long nowNanos = System.nanoTime();
-            if (entry.terminalFailure == TerminalFailure.GIF_DELETED ||
-                    validRoute(entry, nowNanos) != null) {
+            if (entry.terminalFailure == TerminalFailure.GIF_DELETED) {
+                debug("RESOLVE skip-deleted slug=" + entry.slug + " priority=" + playbackPriority);
+                return;
+            }
+            if (validRoute(entry, nowNanos) != null) {
+                debug("RESOLVE skip-valid slug=" + entry.slug + " priority=" + playbackPriority);
                 return;
             }
 
@@ -465,15 +554,26 @@ public final class RedgifsPlaybackPatch {
                         RESOLVER.remove(pending)) {
                     taskToSchedule = new ResolutionTask(entry, true);
                     entry.pendingTask = taskToSchedule;
+                    debug("RESOLVE promote slug=" + entry.slug);
                 } else {
+                    debug("RESOLVE skip-running slug=" + entry.slug + " priority=" + playbackPriority);
                     return;
                 }
             } else {
                 if (playbackPriority) {
-                    if (nowNanos < entry.nextPlaybackRetryAtNanos) return;
+                    if (nowNanos < entry.nextPlaybackRetryAtNanos) {
+                        debug("RESOLVE skip-playback-cooldown slug=" + entry.slug);
+                        return;
+                    }
                 } else {
-                    if (nowNanos < entry.nextRetryAtNanos) return;
-                    if (RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) return;
+                    if (nowNanos < entry.nextRetryAtNanos) {
+                        debug("RESOLVE skip-prewarm-backoff slug=" + entry.slug);
+                        return;
+                    }
+                    if (RESOLVER.getQueue().size() >= MAX_PENDING_PREWARMS) {
+                        debug("RESOLVE skip-prewarm-cap slug=" + entry.slug);
+                        return;
+                    }
                 }
 
                 taskToSchedule = new ResolutionTask(entry, playbackPriority);
@@ -482,9 +582,13 @@ public final class RedgifsPlaybackPatch {
             }
         }
 
+        debug("RESOLVE schedule slug=" + entry.slug + " priority=" +
+                (taskToSchedule.playbackPriority ? "playback" : "prewarm"));
         try {
             RESOLVER.execute(taskToSchedule);
         } catch (RuntimeException exception) {
+            debug("RESOLVE execute-error slug=" + entry.slug + " error=" +
+                    exception.getClass().getSimpleName());
             synchronized (entry) {
                 if (entry.pendingTask == taskToSchedule) {
                     entry.pendingTask = null;
@@ -526,12 +630,15 @@ public final class RedgifsPlaybackPatch {
                 entry.nextRetryAtNanos = 0;
                 entry.nextPlaybackRetryAtNanos = 0;
                 entry.terminalFailure = TerminalFailure.NONE;
+                debug("RESOLVE success slug=" + entry.slug + " priority=" + playbackPriority +
+                        " url=" + published.directUrl);
             } else if (result.terminalFailure == TerminalFailure.GIF_DELETED) {
                 entry.route = null;
                 entry.failureCount = 0;
                 entry.nextRetryAtNanos = 0;
                 entry.nextPlaybackRetryAtNanos = 0;
                 entry.terminalFailure = TerminalFailure.GIF_DELETED;
+                debug("RESOLVE deleted slug=" + entry.slug);
             } else {
                 long nowNanos = System.nanoTime();
                 entry.failureCount = Math.min(entry.failureCount + 1, MAX_RETRY_EXPONENT + 1);
@@ -540,6 +647,8 @@ public final class RedgifsPlaybackPatch {
                 if (playbackPriority) {
                     entry.nextPlaybackRetryAtNanos = nowNanos + PLAYBACK_RETRY_COOLDOWN_NANOS;
                 }
+                debug("RESOLVE transient-failure slug=" + entry.slug + " priority=" +
+                        playbackPriority + " count=" + entry.failureCount);
             }
             entry.notifyAll();
         }
@@ -548,14 +657,22 @@ public final class RedgifsPlaybackPatch {
     private static ResolutionResult resolveDirectMediaUrl(String slug) {
         try {
             String token = getTemporaryToken();
-            if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
+            if (token == null) {
+                debug("RESOLVE auth-token-null slug=" + slug);
+                return ResolutionResult.TRANSIENT_FAILURE;
+            }
 
             Response response = requestGifInfo(slug, token);
+            debug("RESOLVE info slug=" + slug + " code=" + response.code);
             if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
                 clearTemporaryToken(token);
                 token = getTemporaryToken();
-                if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
+                if (token == null) {
+                    debug("RESOLVE reauth-token-null slug=" + slug);
+                    return ResolutionResult.TRANSIENT_FAILURE;
+                }
                 response = requestGifInfo(slug, token);
+                debug("RESOLVE info-retry slug=" + slug + " code=" + response.code);
             }
 
             if (response.code == HttpURLConnection.HTTP_GONE &&
@@ -567,8 +684,15 @@ public final class RedgifsPlaybackPatch {
             }
 
             DirectMedia directMedia = extractDirectMedia(response.body);
-            if (directMedia == null) return ResolutionResult.TRANSIENT_FAILURE;
+            if (directMedia == null) {
+                debug("RESOLVE no-direct-media slug=" + slug);
+                return ResolutionResult.TRANSIENT_FAILURE;
+            }
+            debug("RESOLVE direct slug=" + slug + " variant=" + directMedia.variant +
+                    " url=" + directMedia.url);
             ProbeResult probe = probeDirectMediaUrl(directMedia.url, slug);
+            debug("RESOLVE probe slug=" + slug + " code=" + probe.code +
+                    " final=" + probe.finalUrl);
             if (probe.code >= 200 && probe.code < 300) {
                 return ResolutionResult.success(
                         directMedia.url,
@@ -587,12 +711,15 @@ public final class RedgifsPlaybackPatch {
                 token = getTemporaryToken();
                 if (token == null) return ResolutionResult.TRANSIENT_FAILURE;
                 response = requestGifInfo(slug, token);
+                debug("RESOLVE probe-reauth-info slug=" + slug + " code=" + response.code);
                 if (response.code < 200 || response.code >= 300) {
                     return ResolutionResult.TRANSIENT_FAILURE;
                 }
                 directMedia = extractDirectMedia(response.body);
                 if (directMedia == null) return ResolutionResult.TRANSIENT_FAILURE;
                 probe = probeDirectMediaUrl(directMedia.url, slug);
+                debug("RESOLVE probe-retry slug=" + slug + " code=" + probe.code +
+                        " final=" + probe.finalUrl);
                 if (probe.code >= 200 && probe.code < 300) {
                     return ResolutionResult.success(
                             directMedia.url,
@@ -606,7 +733,9 @@ public final class RedgifsPlaybackPatch {
                 }
             }
             return ResolutionResult.TRANSIENT_FAILURE;
-        } catch (IOException ignored) {
+        } catch (IOException exception) {
+            debug("RESOLVE io-error slug=" + slug + " error=" +
+                    exception.getClass().getSimpleName());
             return ResolutionResult.TRANSIENT_FAILURE;
         }
     }
@@ -972,10 +1101,13 @@ public final class RedgifsPlaybackPatch {
                 entry.pendingTask = null;
             }
 
+            debug("RESOLVE run slug=" + entry.slug + " priority=" + playbackPriority);
             ResolutionResult result = ResolutionResult.TRANSIENT_FAILURE;
             try {
                 result = resolveDirectMediaUrl(entry.slug);
-            } catch (RuntimeException ignored) {
+            } catch (RuntimeException exception) {
+                debug("RESOLVE runtime-error slug=" + entry.slug + " error=" +
+                        exception.getClass().getSimpleName());
             }
             completeResolution(entry, result, playbackPriority);
         }
