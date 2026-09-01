@@ -38,6 +38,8 @@ private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/reddit/patches/RedgifsDebug;"
 private const val HYDRATION_PROBE_CLASS =
     "Lapp/morphe/extension/reddit/patches/RedgifsHydrationProbe;"
+private const val REWRITE_SOURCE_PROBE_CLASS =
+    "Lapp/morphe/extension/reddit/patches/RedgifsRewriteSourceProbe;"
 
 private const val MEDIA_FRAGMENT_INTERFACE =
     $$"Lapp/morphe/extension/reddit/patches/RedgifsPlaybackPatch$MediaFragmentInterface;"
@@ -253,8 +255,8 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
         }
 
         /*
-         * Diagnostic only: observe hydration of the exact persisted HOME/BEST fixture that showed
-         * the cold-start no_identity race. This does not register identity or start resolution.
+         * Diagnostic only: observe hydration of persisted/transient RedGIFs LinkDataModels.
+         * This does not register identity or start resolution.
          */
         val linkDataModelClass = mutableClassDefBy(LINK_DATA_MODEL_CLASS)
         val linkDataModelConstructorParameters = listOf(
@@ -335,6 +337,15 @@ val fixRedgifsFeedAudioPatch = bytecodePatch(
         constructor.addInstructions(
             superCallIndex + 1,
             listOf(
+                invokeStaticRange(
+                    "observe",
+                    listOf("Ljava/lang/String;"),
+                    "Ljava/lang/String;",
+                    urlRegister,
+                    1,
+                    REWRITE_SOURCE_PROBE_CLASS,
+                ),
+                BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, urlRegister),
                 invokeStaticRange(
                     "rewritePlaybackUrl",
                     listOf("Ljava/lang/String;"),
